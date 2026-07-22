@@ -1,0 +1,14 @@
+{
+  "name": "company-knowledge-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local company knowledge base Q&A prototype.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

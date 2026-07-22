@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>公司知识问答</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <canvas class="resonance-canvas" id="resonance-canvas" aria-hidden="true"></canvas>
+    <div class="page-grid" aria-hidden="true"></div>
+
+    <main class="shell">
+      <header class="site-brand" aria-label="共振体 Resonator">
+        <div class="brand-wordmark">
+          <span class="brand-cn">共振体</span>
+          <span class="brand-divider"></span>
+          <span class="brand-en">RESONATOR</span>
+        </div>
+        <span class="brand-tag">COMMUNICATION</span>
+      </header>
+
+      <section class="ask-panel" aria-labelledby="page-title">
+        <div class="resonance-stage" aria-hidden="true">
+          <div class="resonance-wave wave-back"></div>
+          <div class="resonance-wave wave-front"></div>
+          <div class="resonance-core">
+            <div class="core-orbit orbit-one"></div>
+            <div class="core-orbit orbit-two"></div>
+            <div class="core-orbit orbit-three"></div>
+            <div class="core-gem"></div>
+            <div class="core-flare"></div>
+          </div>
+          <div class="energy-star"></div>
+        </div>
+        <p class="eyebrow">AI 共振家</p>
+        <h1 id="page-title">公司知识问答</h1>
+        <p class="subtitle">愿力共生，把本地知识库转成可追溯的 AI 回答。</p>
+
+        <form id="ask-form" class="composer">
+          <textarea
+            id="question"
+            name="question"
+            rows="4"
+            placeholder="试试输入：梦星鸣潮每日返图传哪里？"
+            required
+          ></textarea>
+          <div class="composer-actions">
+            <button type="button" class="ghost-button" id="sample-button">
+              填入示例
+            </button>
+            <button type="submit" class="primary-button">提问</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="answer-layout">
+        <article class="answer-panel" aria-live="polite">
+          <div class="section-label">回答</div>
+          <div id="answer" class="answer empty">等待你的问题。</div>
+        </article>
+
+        <aside class="source-panel">
+          <div class="section-label">引用来源</div>
+          <div id="sources" class="sources empty">搜索到的知识文件会显示在这里。</div>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
