@@ -472,6 +472,14 @@ sampleButton.addEventListener("click", () => {
   questionInput.focus();
 });
 
+questionInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
+    return;
+  }
+  event.preventDefault();
+  form.requestSubmit();
+});
+
 spaceSelect.addEventListener("change", async () => {
   localStorage.setItem("currentKnowledgeSpace", getCurrentSpace());
   setSpaceMessage(`已切换到：${getCurrentSpace()}`, "success");
