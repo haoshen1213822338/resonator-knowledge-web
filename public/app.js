@@ -11,6 +11,12 @@ const kbOutputName = document.querySelector("#kb-output-name");
 const kbDryRun = document.querySelector("#kb-dry-run");
 const kbUpdate = document.querySelector("#kb-update");
 const kbStatus = document.querySelector("#kb-status");
+const vaultState = document.querySelector("#vault-state");
+const aiFileCount = document.querySelector("#ai-file-count");
+const rawFileCount = document.querySelector("#raw-file-count");
+const apiState = document.querySelector("#api-state");
+const kbPath = document.querySelector("#kb-path");
+const refreshStatus = document.querySelector("#refresh-status");
 
 const root = document.documentElement;
 const pointer = {
@@ -269,6 +275,47 @@ function createResonanceField() {
   };
 }
 
+function formatLatestUpdate(value) {
+  if (!value) {
+    return "暂无资料";
+  }
+  return new Date(value).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function renderKnowledgeStatus(status) {
+  vaultState.textContent = status.ok ? "已初始化" : "异常";
+  aiFileCount.textContent = `${status.counts?.aiFiles ?? 0} 个`;
+  rawFileCount.textContent = `${status.counts?.rawFiles ?? 0} 个`;
+  apiState.textContent = status.hasApiKey ? "已连接" : "未配置";
+  kbPath.textContent = [
+    `仓库：${status.vaultDir}`,
+    `最近更新：${formatLatestUpdate(status.latestUpdate)}`,
+  ].join("  ·  ");
+}
+
+async function loadKnowledgeStatus() {
+  try {
+    vaultState.textContent = "检查中";
+    apiState.textContent = "检查中";
+    const response = await fetch("/api/kb-status");
+    const status = await response.json();
+    if (!response.ok) {
+      throw new Error(status.detail || status.error || "状态检查失败");
+    }
+    renderKnowledgeStatus(status);
+  } catch (error) {
+    vaultState.textContent = "异常";
+    apiState.textContent = "待检查";
+    kbPath.textContent =
+      error instanceof Error ? error.message : "无法读取知识库状态。";
+  }
+}
+
 function setUpdateLoading(message) {
   kbStatus.className = "update-status";
   kbStatus.textContent = message;
@@ -315,6 +362,7 @@ async function runKnowledgeUpdate(dryRun) {
       ? `\n\n原始资料已保存：\n${payload.savedFiles.join("\n")}`
       : "";
     kbStatus.textContent = `${payload.stdout || "更新完成。"}${saved}`;
+    await loadKnowledgeStatus();
   } catch (error) {
     kbStatus.className = "update-status error";
     kbStatus.textContent =
@@ -348,8 +396,10 @@ sampleButton.addEventListener("click", () => {
   questionInput.focus();
 });
 
+refreshStatus.addEventListener("click", loadKnowledgeStatus);
 kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));
+loadKnowledgeStatus();
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();

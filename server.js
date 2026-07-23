@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,18 @@ const DEFAULT_UPDATE_INPUT =
   "00_原始资料\\候选材料包\\流程测试_梦星鸣潮_每日返图";
 const UPLOAD_ROOT =
   process.env.UPLOAD_ROOT || path.join(VAULT_DIR, "00_原始资料", "网页上传");
+const RAW_DIR = path.join(VAULT_DIR, "00_原始资料");
+const SYSTEM_DIR = path.join(VAULT_DIR, "99_系统配置");
+const UPDATE_LOG_DIR = path.join(SYSTEM_DIR, "update_logs");
+const IMPORT_INDEX = path.join(SYSTEM_DIR, "资料入库记录.md");
+const VAULT_FOLDERS = [
+  RAW_DIR,
+  UPLOAD_ROOT,
+  KNOWLEDGE_DIR,
+  SYSTEM_DIR,
+  path.join(SYSTEM_DIR, "scripts"),
+  UPDATE_LOG_DIR,
+];
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -73,6 +85,103 @@ function sendJson(response, statusCode, payload) {
     "Content-Type": "application/json; charset=utf-8",
   });
   response.end(JSON.stringify(payload, null, 2));
+}
+
+async function pathExists(targetPath) {
+  try {
+    await stat(targetPath);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function ensureKnowledgeBase() {
+  for (const folder of VAULT_FOLDERS) {
+    await mkdir(folder, { recursive: true });
+  }
+
+  if (!(await pathExists(IMPORT_INDEX))) {
+    await writeFile(
+      IMPORT_INDEX,
+      [
+        "# 资料入库记录",
+        "",
+        "这里记录网页端上传资料、AI 整理输出和本地知识库更新情况。",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+  }
+}
+
+async function listFilesRecursive(directory, extensions = null) {
+  if (!(await pathExists(directory))) {
+    return [];
+  }
+
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const fullPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await listFilesRecursive(fullPath, extensions));
+      continue;
+    }
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (extensions && !extensions.has(path.extname(entry.name).toLowerCase())) {
+      continue;
+    }
+    files.push(fullPath);
+  }
+  return files;
+}
+
+async function getLatestWriteTime(files) {
+  let latest = null;
+  for (const file of files) {
+    const info = await stat(file);
+    if (!latest || info.mtime > latest) {
+      latest = info.mtime;
+    }
+  }
+  return latest ? latest.toISOString() : null;
+}
+
+async function getKnowledgeBaseStatus() {
+  await ensureKnowledgeBase();
+
+  const supportedFiles = new Set([".md", ".txt", ".csv"]);
+  const rawFiles = await listFilesRecursive(RAW_DIR, supportedFiles);
+  const uploadedFiles = await listFilesRecursive(UPLOAD_ROOT, supportedFiles);
+  const aiFiles = await listFilesRecursive(KNOWLEDGE_DIR, new Set([".md"]));
+  const allFiles = [...rawFiles, ...aiFiles];
+
+  return {
+    ok: true,
+    vaultDir: VAULT_DIR,
+    rawDir: RAW_DIR,
+    uploadRoot: UPLOAD_ROOT,
+    knowledgeDir: KNOWLEDGE_DIR,
+    systemDir: SYSTEM_DIR,
+    importIndex: IMPORT_INDEX,
+    updateScript: UPDATE_SCRIPT,
+    updateScriptExists: await pathExists(UPDATE_SCRIPT),
+    hasApiKey: Boolean(AI_API_KEY),
+    aiProvider: AI_PROVIDER,
+    aiModel: AI_MODEL,
+    counts: {
+      rawFiles: rawFiles.length,
+      uploadedFiles: uploadedFiles.length,
+      aiFiles: aiFiles.length,
+    },
+    latestUpdate: await getLatestWriteTime(allFiles),
+  };
 }
 
 function buildKnowledgeContext(results) {
@@ -200,6 +309,165 @@ async function callAI(question, results) {
   return callChatCompletionsApi(question, results, instructions, knowledgeContext);
 }
 
+function buildOrganizationInstructions(mode) {
+  const modeNames = {
+    project: "项目资料",
+    faq: "FAQ",
+    sop: "SOP",
+    analysis: "项目分析",
+    mixed: "综合整理",
+  };
+  return [
+    "你是公司的本地知识库整理助手。",
+    "任务是把用户上传的原始资料整理成适合写入 Obsidian 的 Markdown 文档。",
+    `本次整理类型：${modeNames[mode] || "综合整理"}。`,
+    "要求：",
+    "1. 只根据上传资料整理，不要编造事实。",
+    "2. 保留业务上有用的信息：项目需求、客户信息、执行流程、风险、待确认事项、FAQ、SOP。",
+    "3. 如果资料不足，要明确标注“资料不足/待确认”。",
+    "4. 不要输出手机号、验证码、账号密码、订单号等敏感信息。",
+    "5. 使用清晰的 Markdown 标题和列表，方便后续在 Obsidian 中继续编辑。",
+    "6. 最后加一节“来源文件”，列出用到的上传文件名。",
+  ].join("\n");
+}
+
+async function callOrganizationApi({ project, mode, documents }) {
+  if (!AI_API_KEY) {
+    throw new Error("未配置 AI_API_KEY，无法自动整理资料。");
+  }
+
+  const sourceText = documents
+    .map((document, index) => {
+      return [
+        `# 来源 ${index + 1}：${document.fileName}`,
+        document.content,
+      ].join("\n\n");
+    })
+    .join("\n\n---\n\n")
+    .slice(0, 48_000);
+
+  const apiResponse = await fetch(`${AI_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${AI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: AI_MODEL,
+      messages: [
+        { role: "system", content: buildOrganizationInstructions(mode) },
+        {
+          role: "user",
+          content: [
+            `项目名称：${project}`,
+            "",
+            "请把下面资料整理成一份可直接存入公司 Obsidian 知识库的 Markdown 文档：",
+            "",
+            sourceText || "资料为空。",
+          ].join("\n"),
+        },
+      ],
+      temperature: 0.2,
+    }),
+  });
+
+  const payload = await apiResponse.json().catch(() => ({}));
+  if (!apiResponse.ok) {
+    throw new Error(payload.error?.message || `AI 接口请求失败：${apiResponse.status}`);
+  }
+
+  const text = extractChatCompletionText(payload);
+  if (!text) {
+    throw new Error("AI 没有返回可写入的整理内容。");
+  }
+  return text;
+}
+
+async function loadUploadedDocuments(savedFiles) {
+  const documents = [];
+  for (const filePath of savedFiles) {
+    documents.push({
+      fileName: path.basename(filePath),
+      relativePath: path.relative(VAULT_DIR, filePath),
+      content: await readFile(filePath, "utf8"),
+    });
+  }
+  return documents;
+}
+
+function getOutputFileName(project, outputName) {
+  const trimmed = String(outputName || "").trim();
+  if (trimmed) {
+    const safeName = safePathSegment(trimmed);
+    return safeName.toLowerCase().endsWith(".md") ? safeName : `${safeName}.md`;
+  }
+
+  const date = new Date().toISOString().slice(0, 10);
+  return `${safePathSegment(project)}_资料整理_${date}.md`;
+}
+
+async function writeKnowledgeOutput({ project, mode, outputName, savedFiles, content }) {
+  await ensureKnowledgeBase();
+
+  const outputFileName = getOutputFileName(project, outputName);
+  const outputPath = path.join(KNOWLEDGE_DIR, outputFileName);
+  const createdAt = new Date().toISOString();
+  const sourceList = savedFiles
+    .map((filePath) => `- ${path.relative(VAULT_DIR, filePath)}`)
+    .join("\n");
+  const finalContent = [
+    "---",
+    `project: ${project}`,
+    `mode: ${mode}`,
+    `created: ${createdAt}`,
+    "source: web-upload",
+    "---",
+    "",
+    content.trim(),
+    "",
+    "## 系统入库信息",
+    "",
+    sourceList,
+    "",
+  ].join("\n");
+
+  await writeFile(outputPath, finalContent, "utf8");
+
+  const logPath = path.join(
+    UPDATE_LOG_DIR,
+    `web_import_${createdAt.replace(/[-:.]/g, "").replace("T", "_").replace("Z", "")}.json`
+  );
+  await writeFile(
+    logPath,
+    JSON.stringify({
+      project,
+      mode,
+      outputPath,
+      sourceFiles: savedFiles,
+      model: AI_MODEL,
+      createdAt,
+    }, null, 2),
+    "utf8"
+  );
+
+  await appendFile(
+    IMPORT_INDEX,
+    [
+      `## ${createdAt} ${project}`,
+      "",
+      `- 整理类型：${mode}`,
+      `- 输出文件：${path.relative(VAULT_DIR, outputPath)}`,
+      `- 更新日志：${path.relative(VAULT_DIR, logPath)}`,
+      "- 来源文件：",
+      sourceList,
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+
+  return { outputPath, logPath };
+}
+
 function normalizeText(text) {
   return text
     .toLowerCase()
@@ -291,16 +559,7 @@ function scoreDocument(content, fileName, tokens) {
 }
 
 async function listMarkdownFiles(directory) {
-  const entries = await readdir(directory);
-  const files = [];
-  for (const entry of entries) {
-    const fullPath = path.join(directory, entry);
-    const info = await stat(fullPath);
-    if (info.isFile() && entry.endsWith(".md")) {
-      files.push(fullPath);
-    }
-  }
-  return files;
+  return listFilesRecursive(directory, new Set([".md"]));
 }
 
 async function searchKnowledge(question) {
@@ -661,13 +920,42 @@ async function handleImportKnowledge(request, response) {
     }
 
     const saved = await saveUploadedFiles(project, files);
-    const result = await runUpdateScript({
-      input: saved.relativeInput,
-      project,
-      mode,
-      outputName,
-      dryRun,
-    });
+    let result;
+    if (dryRun) {
+      const documents = await loadUploadedDocuments(saved.savedFiles);
+      const totalChars = documents.reduce((total, item) => total + item.content.length, 0);
+      result = {
+        stdout: [
+          "Dry run: 不调用 API，不写入 90_AI输出。",
+          `项目：${project}`,
+          `模式：${mode}`,
+          `输入文件数：${documents.length}`,
+          `预计发送字符数：${Math.min(totalChars, 48_000)}`,
+          ...documents.map((item) => `- ${item.relativePath}`),
+        ].join("\n"),
+        stderr: "",
+      };
+    } else {
+      const documents = await loadUploadedDocuments(saved.savedFiles);
+      const organizedContent = await callOrganizationApi({ project, mode, documents });
+      const written = await writeKnowledgeOutput({
+        project,
+        mode,
+        outputName,
+        savedFiles: saved.savedFiles,
+        content: organizedContent,
+      });
+      result = {
+        stdout: [
+          `知识整理已生成：${written.outputPath}`,
+          `更新日志已记录：${written.logPath}`,
+          `原始资料目录：${saved.uploadDir}`,
+        ].join("\n"),
+        stderr: "",
+        outputPath: written.outputPath,
+        logPath: written.logPath,
+      };
+    }
 
     sendJson(response, 200, {
       ok: true,
@@ -676,6 +964,8 @@ async function handleImportKnowledge(request, response) {
       savedFiles: saved.savedFiles,
       stdout: result.stdout.trim(),
       stderr: result.stderr.trim(),
+      outputPath: result.outputPath,
+      logPath: result.logPath,
     });
   } catch (error) {
     sendJson(response, 500, {
@@ -725,7 +1015,21 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "GET" && request.url === "/api/kb-status") {
+    try {
+      sendJson(response, 200, await getKnowledgeBaseStatus());
+    } catch (error) {
+      sendJson(response, 500, {
+        ok: false,
+        error: "知识库状态检查失败",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return;
+  }
+
   if (request.method === "GET" && request.url === "/api/health") {
+    const status = await getKnowledgeBaseStatus();
     sendJson(response, 200, {
       ok: true,
       knowledgeDir: KNOWLEDGE_DIR,
@@ -735,6 +1039,8 @@ const server = createServer(async (request, response) => {
       hasApiKey: Boolean(AI_API_KEY),
       vaultDir: VAULT_DIR,
       updateScript: UPDATE_SCRIPT,
+      counts: status.counts,
+      latestUpdate: status.latestUpdate,
     });
     return;
   }
@@ -747,6 +1053,8 @@ const server = createServer(async (request, response) => {
   response.writeHead(405);
   response.end("Method not allowed");
 });
+
+await ensureKnowledgeBase();
 
 server.listen(PORT, () => {
   console.log(`知识库网页已启动：http://localhost:${PORT}`);

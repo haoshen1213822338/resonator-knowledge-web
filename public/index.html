@@ -54,6 +54,34 @@
         </form>
       </section>
 
+      <section class="status-panel" aria-labelledby="status-title">
+        <div class="section-label" id="status-title">知识库状态</div>
+        <div class="status-grid">
+          <div class="status-item">
+            <span>本地仓库</span>
+            <strong id="vault-state">检查中</strong>
+          </div>
+          <div class="status-item">
+            <span>AI 输出</span>
+            <strong id="ai-file-count">-</strong>
+          </div>
+          <div class="status-item">
+            <span>原始资料</span>
+            <strong id="raw-file-count">-</strong>
+          </div>
+          <div class="status-item">
+            <span>DeepSeek</span>
+            <strong id="api-state">检查中</strong>
+          </div>
+        </div>
+        <div class="status-footer">
+          <span id="kb-path">正在读取本地知识库路径。</span>
+          <button type="button" class="ghost-button compact-button" id="refresh-status">
+            刷新状态
+          </button>
+        </div>
+      </section>
+
       <section class="update-panel" aria-labelledby="update-title">
         <div class="section-label" id="update-title">资料入库</div>
         <div class="update-grid">
