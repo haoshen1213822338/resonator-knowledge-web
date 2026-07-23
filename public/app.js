@@ -5,7 +5,7 @@ const sourcesBox = document.querySelector("#sources");
 const sampleButton = document.querySelector("#sample-button");
 const canvas = document.querySelector("#resonance-canvas");
 const kbProject = document.querySelector("#kb-project");
-const kbInput = document.querySelector("#kb-input");
+const kbFile = document.querySelector("#kb-file");
 const kbMode = document.querySelector("#kb-mode");
 const kbOutputName = document.querySelector("#kb-output-name");
 const kbDryRun = document.querySelector("#kb-dry-run");
@@ -282,19 +282,27 @@ function setUpdateIdle() {
 }
 
 async function runKnowledgeUpdate(dryRun) {
-  setUpdateLoading(dryRun ? "正在预检查资料..." : "正在更新知识库，可能需要几十秒...");
+  if (!kbFile.files || kbFile.files.length === 0) {
+    kbStatus.className = "update-status error";
+    kbStatus.textContent = "请先选择要上传的 md、txt 或 csv 文件。";
+    return;
+  }
+
+  setUpdateLoading(dryRun ? "正在预检查上传资料..." : "正在上传并整理，可能需要几十秒...");
 
   try {
-    const response = await fetch("/api/update-kb", {
+    const formData = new FormData();
+    formData.append("project", kbProject.value.trim());
+    formData.append("mode", kbMode.value);
+    formData.append("outputName", kbOutputName.value.trim());
+    formData.append("dryRun", String(dryRun));
+    for (const file of kbFile.files) {
+      formData.append("files", file);
+    }
+
+    const response = await fetch("/api/import-kb", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project: kbProject.value.trim(),
-        input: kbInput.value.trim(),
-        mode: kbMode.value,
-        outputName: kbOutputName.value.trim(),
-        dryRun,
-      }),
+      body: formData,
     });
     const payload = await response.json();
 
@@ -303,7 +311,10 @@ async function runKnowledgeUpdate(dryRun) {
     }
 
     kbStatus.className = "update-status success";
-    kbStatus.textContent = payload.stdout || "更新完成。";
+    const saved = payload.savedFiles?.length
+      ? `\n\n原始资料已保存：\n${payload.savedFiles.join("\n")}`
+      : "";
+    kbStatus.textContent = `${payload.stdout || "更新完成。"}${saved}`;
   } catch (error) {
     kbStatus.className = "update-status error";
     kbStatus.textContent =

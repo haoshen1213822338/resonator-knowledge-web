@@ -55,18 +55,15 @@
       </section>
 
       <section class="update-panel" aria-labelledby="update-title">
-        <div class="section-label" id="update-title">知识库更新</div>
+        <div class="section-label" id="update-title">资料入库</div>
         <div class="update-grid">
           <label>
             <span>项目名称</span>
             <input id="kb-project" value="梦星鸣潮" />
           </label>
           <label>
-            <span>资料路径</span>
-            <input
-              id="kb-input"
-              value="00_原始资料\候选材料包\流程测试_梦星鸣潮_每日返图"
-            />
+            <span>上传资料</span>
+            <input id="kb-file" type="file" accept=".md,.txt,.csv" multiple />
           </label>
           <label>
             <span>整理类型</span>
@@ -88,10 +85,10 @@
             预检查
           </button>
           <button type="button" class="primary-button" id="kb-update">
-            更新知识库
+            上传并整理
           </button>
         </div>
-        <pre id="kb-status" class="update-status">等待更新任务。</pre>
+        <pre id="kb-status" class="update-status">选择 md、txt 或 csv 文件后，可以先预检查，再上传并整理。</pre>
       </section>
 
       <section class="answer-layout">

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,9 @@ const PYTHON_CMD = process.env.PYTHON_CMD || "python";
 const DEFAULT_UPDATE_INPUT =
   process.env.DEFAULT_UPDATE_INPUT ||
   "00_原始资料\\候选材料包\\流程测试_梦星鸣潮_每日返图";
+const UPLOAD_ROOT =
+  process.env.UPLOAD_ROOT || path.join(VAULT_DIR, "00_原始资料", "网页上传");
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 8_000_000);
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -505,6 +508,189 @@ async function handleUpdateKnowledge(request, response) {
   }
 }
 
+async function readRequestBuffer(request) {
+  const chunks = [];
+  let totalLength = 0;
+  for await (const chunk of request) {
+    totalLength += chunk.length;
+    if (totalLength > MAX_UPLOAD_BYTES) {
+      throw new Error("上传文件过大，请控制在 8MB 以内。");
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function parseContentDisposition(value) {
+  const result = {};
+  for (const part of value.split(";")) {
+    const [rawKey, ...rawValue] = part.trim().split("=");
+    if (!rawKey || rawValue.length === 0) {
+      continue;
+    }
+    const rawParameter = rawValue.join("=").trim().replace(/^"|"$/g, "");
+    if (rawKey.endsWith("*")) {
+      const key = rawKey.slice(0, -1);
+      const encoded = rawParameter.replace(/^UTF-8''/i, "");
+      result[key] = decodeURIComponent(encoded);
+      continue;
+    }
+    result[rawKey] = Buffer.from(rawParameter, "latin1").toString("utf8");
+  }
+  return result;
+}
+
+function parseMultipartForm(request, bodyBuffer) {
+  const contentType = request.headers["content-type"] || "";
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/);
+  const boundary = boundaryMatch?.[1] || boundaryMatch?.[2];
+  if (!boundary) {
+    throw new Error("上传请求缺少 multipart boundary。");
+  }
+
+  const body = bodyBuffer.toString("latin1");
+  const parts = body.split(`--${boundary}`);
+  const fields = {};
+  const files = [];
+
+  for (const rawPart of parts) {
+    if (!rawPart || rawPart === "--\r\n" || rawPart === "--") {
+      continue;
+    }
+
+    const part = rawPart.replace(/^\r\n/, "").replace(/\r\n--$/, "");
+    const separatorIndex = part.indexOf("\r\n\r\n");
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const rawHeaders = part.slice(0, separatorIndex);
+    let content = part.slice(separatorIndex + 4);
+    if (content.endsWith("\r\n")) {
+      content = content.slice(0, -2);
+    }
+
+    const headers = Object.fromEntries(
+      rawHeaders.split("\r\n").map((line) => {
+        const index = line.indexOf(":");
+        if (index === -1) {
+          return ["", ""];
+        }
+        return [
+          line.slice(0, index).trim().toLowerCase(),
+          line.slice(index + 1).trim(),
+        ];
+      }).filter(([key]) => key)
+    );
+    const disposition = parseContentDisposition(headers["content-disposition"] || "");
+    if (!disposition.name) {
+      continue;
+    }
+
+    if (disposition.filename) {
+      files.push({
+        fieldName: disposition.name,
+        fileName: disposition.filename,
+        contentType: headers["content-type"] || "application/octet-stream",
+        buffer: Buffer.from(content, "latin1"),
+      });
+    } else {
+      fields[disposition.name] = Buffer.from(content, "latin1").toString("utf8");
+    }
+  }
+
+  return { fields, files };
+}
+
+function safePathSegment(value) {
+  return String(value || "")
+    .replace(/[<>:"/\\|?*\r\n]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^\.+|\.+$/g, "")
+    .slice(0, 80) || "未命名";
+}
+
+function validateUploadFile(file) {
+  const extension = path.extname(file.fileName).toLowerCase();
+  if (![".md", ".txt", ".csv"].includes(extension)) {
+    throw new Error("目前只支持上传 .md、.txt、.csv 文件。");
+  }
+  if (file.buffer.length === 0) {
+    throw new Error(`文件内容为空：${file.fileName}`);
+  }
+}
+
+async function saveUploadedFiles(project, files) {
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\..+$/, "")
+    .replace("T", "_");
+  const folderName = `${timestamp}_${safePathSegment(project)}`;
+  const uploadDir = path.join(UPLOAD_ROOT, folderName);
+  await mkdir(uploadDir, { recursive: true });
+
+  const savedFiles = [];
+  for (const file of files) {
+    validateUploadFile(file);
+    const fileName = safePathSegment(path.basename(file.fileName));
+    const targetPath = path.join(uploadDir, fileName);
+    await writeFile(targetPath, file.buffer);
+    savedFiles.push(targetPath);
+  }
+
+  const relativeInput = path.relative(VAULT_DIR, uploadDir);
+  return { uploadDir, relativeInput, savedFiles };
+}
+
+async function handleImportKnowledge(request, response) {
+  try {
+    const bodyBuffer = await readRequestBuffer(request);
+    const { fields, files } = parseMultipartForm(request, bodyBuffer);
+    const project = String(fields.project || "未命名项目").trim();
+    const mode = String(fields.mode || "mixed").trim();
+    const outputName = String(fields.outputName || "").trim();
+    const dryRun = fields.dryRun === "true";
+
+    if (!project) {
+      sendJson(response, 400, { error: "项目名称不能为空" });
+      return;
+    }
+    if (!files.length) {
+      sendJson(response, 400, { error: "请先选择要上传的资料文件" });
+      return;
+    }
+    if (!["project", "faq", "sop", "analysis", "mixed"].includes(mode)) {
+      sendJson(response, 400, { error: "整理类型不支持" });
+      return;
+    }
+
+    const saved = await saveUploadedFiles(project, files);
+    const result = await runUpdateScript({
+      input: saved.relativeInput,
+      project,
+      mode,
+      outputName,
+      dryRun,
+    });
+
+    sendJson(response, 200, {
+      ok: true,
+      dryRun,
+      uploadDir: saved.uploadDir,
+      savedFiles: saved.savedFiles,
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim(),
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "资料上传或整理失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function serveStatic(request, response) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const safePath = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
@@ -537,6 +723,11 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "POST" && request.url === "/api/update-kb") {
     await handleUpdateKnowledge(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/api/import-kb") {
+    await handleImportKnowledge(request, response);
     return;
   }
 
