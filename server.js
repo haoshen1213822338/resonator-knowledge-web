@@ -29,7 +29,6 @@ const DEFAULT_UPDATE_INPUT =
   "00_原始资料\\候选材料包\\流程测试_梦星鸣潮_每日返图";
 const UPLOAD_ROOT =
   process.env.UPLOAD_ROOT || path.join(VAULT_DIR, "00_原始资料", "网页上传");
-const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 8_000_000);
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -510,12 +509,7 @@ async function handleUpdateKnowledge(request, response) {
 
 async function readRequestBuffer(request) {
   const chunks = [];
-  let totalLength = 0;
   for await (const chunk of request) {
-    totalLength += chunk.length;
-    if (totalLength > MAX_UPLOAD_BYTES) {
-      throw new Error("上传文件过大，请控制在 8MB 以内。");
-    }
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
