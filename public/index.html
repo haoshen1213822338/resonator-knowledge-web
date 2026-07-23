@@ -54,6 +54,24 @@
         </form>
       </section>
 
+      <section class="space-panel" aria-labelledby="space-title">
+        <div class="section-label" id="space-title">当前项目库</div>
+        <div class="space-control">
+          <label>
+            <span>选择项目库</span>
+            <select id="space-select"></select>
+          </label>
+          <label>
+            <span>新建项目库</span>
+            <input id="new-space-name" placeholder="例如：客户A项目库" />
+          </label>
+          <button type="button" class="primary-button compact-button" id="create-space">
+            新建并切换
+          </button>
+        </div>
+        <p id="space-message" class="space-message">项目库会同步创建到本地 Obsidian 仓库。</p>
+      </section>
+
       <section class="status-panel" aria-labelledby="status-title">
         <div class="section-label" id="status-title">知识库状态</div>
         <div class="status-grid">

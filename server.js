@@ -21,26 +21,15 @@ const AI_API_KEY = process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "";
 const AI_MODEL = process.env.AI_MODEL || "deepseek-v4-flash";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const VAULT_DIR = process.env.VAULT_DIR || path.dirname(KNOWLEDGE_DIR);
+const SPACES_ROOT =
+  process.env.SPACES_ROOT || path.join(VAULT_DIR, "knowledge_spaces");
+const DEFAULT_SPACE_ID = process.env.DEFAULT_SPACE_ID || "共振体公司知识库";
 const UPDATE_SCRIPT = process.env.UPDATE_SCRIPT ||
   path.join(VAULT_DIR, "99_系统配置", "scripts", "update_kb.py");
 const PYTHON_CMD = process.env.PYTHON_CMD || "python";
 const DEFAULT_UPDATE_INPUT =
   process.env.DEFAULT_UPDATE_INPUT ||
   "00_原始资料\\候选材料包\\流程测试_梦星鸣潮_每日返图";
-const UPLOAD_ROOT =
-  process.env.UPLOAD_ROOT || path.join(VAULT_DIR, "00_原始资料", "网页上传");
-const RAW_DIR = path.join(VAULT_DIR, "00_原始资料");
-const SYSTEM_DIR = path.join(VAULT_DIR, "99_系统配置");
-const UPDATE_LOG_DIR = path.join(SYSTEM_DIR, "update_logs");
-const IMPORT_INDEX = path.join(SYSTEM_DIR, "资料入库记录.md");
-const VAULT_FOLDERS = [
-  RAW_DIR,
-  UPLOAD_ROOT,
-  KNOWLEDGE_DIR,
-  SYSTEM_DIR,
-  path.join(SYSTEM_DIR, "scripts"),
-  UPDATE_LOG_DIR,
-];
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -99,14 +88,50 @@ async function pathExists(targetPath) {
   }
 }
 
-async function ensureKnowledgeBase() {
-  for (const folder of VAULT_FOLDERS) {
+function normalizeSpaceId(value) {
+  const normalized = safePathSegment(value || DEFAULT_SPACE_ID);
+  return normalized || DEFAULT_SPACE_ID;
+}
+
+function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
+  const id = normalizeSpaceId(spaceId);
+  const root = path.join(SPACES_ROOT, id);
+  const rawDir = path.join(root, "00_原始资料");
+  const uploadRoot = path.join(rawDir, "网页上传");
+  const knowledgeDir = path.join(root, "90_AI输出");
+  const systemDir = path.join(root, "99_系统配置");
+  const updateLogDir = path.join(systemDir, "update_logs");
+  const importIndex = path.join(systemDir, "资料入库记录.md");
+  return {
+    id,
+    root,
+    rawDir,
+    uploadRoot,
+    knowledgeDir,
+    systemDir,
+    updateLogDir,
+    importIndex,
+    folders: [
+      rawDir,
+      uploadRoot,
+      knowledgeDir,
+      systemDir,
+      path.join(systemDir, "scripts"),
+      updateLogDir,
+    ],
+  };
+}
+
+async function ensureKnowledgeBase(spaceId = DEFAULT_SPACE_ID) {
+  await mkdir(SPACES_ROOT, { recursive: true });
+  const paths = getSpacePaths(spaceId);
+  for (const folder of paths.folders) {
     await mkdir(folder, { recursive: true });
   }
 
-  if (!(await pathExists(IMPORT_INDEX))) {
+  if (!(await pathExists(paths.importIndex))) {
     await writeFile(
-      IMPORT_INDEX,
+      paths.importIndex,
       [
         "# 资料入库记录",
         "",
@@ -116,6 +141,23 @@ async function ensureKnowledgeBase() {
       "utf8"
     );
   }
+
+  return paths;
+}
+
+async function listSpaces() {
+  await ensureKnowledgeBase(DEFAULT_SPACE_ID);
+  const entries = await readdir(SPACES_ROOT, { withFileTypes: true });
+  const spaces = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => ({
+      id: entry.name,
+      name: entry.name,
+      isDefault: entry.name === DEFAULT_SPACE_ID,
+    }))
+    .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.name.localeCompare(b.name, "zh-CN"));
+
+  return spaces;
 }
 
 async function listFilesRecursive(directory, extensions = null) {
@@ -153,23 +195,26 @@ async function getLatestWriteTime(files) {
   return latest ? latest.toISOString() : null;
 }
 
-async function getKnowledgeBaseStatus() {
-  await ensureKnowledgeBase();
+async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
+  const paths = await ensureKnowledgeBase(spaceId);
 
   const supportedFiles = new Set([".md", ".txt", ".csv"]);
-  const rawFiles = await listFilesRecursive(RAW_DIR, supportedFiles);
-  const uploadedFiles = await listFilesRecursive(UPLOAD_ROOT, supportedFiles);
-  const aiFiles = await listFilesRecursive(KNOWLEDGE_DIR, new Set([".md"]));
+  const rawFiles = await listFilesRecursive(paths.rawDir, supportedFiles);
+  const uploadedFiles = await listFilesRecursive(paths.uploadRoot, supportedFiles);
+  const aiFiles = await listFilesRecursive(paths.knowledgeDir, new Set([".md"]));
   const allFiles = [...rawFiles, ...aiFiles];
 
   return {
     ok: true,
+    spaceId: paths.id,
+    spaceRoot: paths.root,
+    spacesRoot: SPACES_ROOT,
     vaultDir: VAULT_DIR,
-    rawDir: RAW_DIR,
-    uploadRoot: UPLOAD_ROOT,
-    knowledgeDir: KNOWLEDGE_DIR,
-    systemDir: SYSTEM_DIR,
-    importIndex: IMPORT_INDEX,
+    rawDir: paths.rawDir,
+    uploadRoot: paths.uploadRoot,
+    knowledgeDir: paths.knowledgeDir,
+    systemDir: paths.systemDir,
+    importIndex: paths.importIndex,
     updateScript: UPDATE_SCRIPT,
     updateScriptExists: await pathExists(UPDATE_SCRIPT),
     hasApiKey: Boolean(AI_API_KEY),
@@ -383,12 +428,12 @@ async function callOrganizationApi({ project, mode, documents }) {
   return text;
 }
 
-async function loadUploadedDocuments(savedFiles) {
+async function loadUploadedDocuments(savedFiles, spaceRoot) {
   const documents = [];
   for (const filePath of savedFiles) {
     documents.push({
       fileName: path.basename(filePath),
-      relativePath: path.relative(VAULT_DIR, filePath),
+      relativePath: path.relative(spaceRoot, filePath),
       content: await readFile(filePath, "utf8"),
     });
   }
@@ -406,14 +451,14 @@ function getOutputFileName(project, outputName) {
   return `${safePathSegment(project)}_资料整理_${date}.md`;
 }
 
-async function writeKnowledgeOutput({ project, mode, outputName, savedFiles, content }) {
-  await ensureKnowledgeBase();
+async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedFiles, content }) {
+  const paths = await ensureKnowledgeBase(spaceId);
 
   const outputFileName = getOutputFileName(project, outputName);
-  const outputPath = path.join(KNOWLEDGE_DIR, outputFileName);
+  const outputPath = path.join(paths.knowledgeDir, outputFileName);
   const createdAt = new Date().toISOString();
   const sourceList = savedFiles
-    .map((filePath) => `- ${path.relative(VAULT_DIR, filePath)}`)
+    .map((filePath) => `- ${path.relative(paths.root, filePath)}`)
     .join("\n");
   const finalContent = [
     "---",
@@ -434,7 +479,7 @@ async function writeKnowledgeOutput({ project, mode, outputName, savedFiles, con
   await writeFile(outputPath, finalContent, "utf8");
 
   const logPath = path.join(
-    UPDATE_LOG_DIR,
+    paths.updateLogDir,
     `web_import_${createdAt.replace(/[-:.]/g, "").replace("T", "_").replace("Z", "")}.json`
   );
   await writeFile(
@@ -451,13 +496,13 @@ async function writeKnowledgeOutput({ project, mode, outputName, savedFiles, con
   );
 
   await appendFile(
-    IMPORT_INDEX,
+    paths.importIndex,
     [
       `## ${createdAt} ${project}`,
       "",
       `- 整理类型：${mode}`,
-      `- 输出文件：${path.relative(VAULT_DIR, outputPath)}`,
-      `- 更新日志：${path.relative(VAULT_DIR, logPath)}`,
+      `- 输出文件：${path.relative(paths.root, outputPath)}`,
+      `- 更新日志：${path.relative(paths.root, logPath)}`,
       "- 来源文件：",
       sourceList,
       "",
@@ -562,13 +607,14 @@ async function listMarkdownFiles(directory) {
   return listFilesRecursive(directory, new Set([".md"]));
 }
 
-async function searchKnowledge(question) {
+async function searchKnowledge(question, spaceId = DEFAULT_SPACE_ID) {
   const tokens = tokenize(question);
   if (tokens.length === 0) {
     return [];
   }
 
-  const files = await listMarkdownFiles(KNOWLEDGE_DIR);
+  const paths = await ensureKnowledgeBase(spaceId);
+  const files = await listMarkdownFiles(paths.knowledgeDir);
   const results = [];
   for (const filePath of files) {
     const content = await readFile(filePath, "utf8");
@@ -625,18 +671,20 @@ async function handleAsk(request, response) {
   }
 
   const question = String(payload.question || "").trim();
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
   if (!question) {
     sendJson(response, 400, { error: "请输入问题" });
     return;
   }
 
   try {
-    const results = await searchKnowledge(question);
+    const results = await searchKnowledge(question, space);
     const aiAnswer = await callAI(question, results);
     sendJson(response, 200, {
       answer: aiAnswer || buildDraftAnswer(question, results),
       citations: results,
       mode: aiAnswer ? "ai" : "local-search",
+      space,
     });
   } catch (error) {
     sendJson(response, 500, {
@@ -874,14 +922,15 @@ function validateUploadFile(file) {
   }
 }
 
-async function saveUploadedFiles(project, files) {
+async function saveUploadedFiles(spaceId, project, files) {
+  const paths = await ensureKnowledgeBase(spaceId);
   const timestamp = new Date()
     .toISOString()
     .replace(/[-:]/g, "")
     .replace(/\..+$/, "")
     .replace("T", "_");
   const folderName = `${timestamp}_${safePathSegment(project)}`;
-  const uploadDir = path.join(UPLOAD_ROOT, folderName);
+  const uploadDir = path.join(paths.uploadRoot, folderName);
   await mkdir(uploadDir, { recursive: true });
 
   const savedFiles = [];
@@ -893,14 +942,15 @@ async function saveUploadedFiles(project, files) {
     savedFiles.push(targetPath);
   }
 
-  const relativeInput = path.relative(VAULT_DIR, uploadDir);
-  return { uploadDir, relativeInput, savedFiles };
+  const relativeInput = path.relative(paths.root, uploadDir);
+  return { uploadDir, relativeInput, savedFiles, spaceRoot: paths.root };
 }
 
 async function handleImportKnowledge(request, response) {
   try {
     const bodyBuffer = await readRequestBuffer(request);
     const { fields, files } = parseMultipartForm(request, bodyBuffer);
+    const space = normalizeSpaceId(fields.space || DEFAULT_SPACE_ID);
     const project = String(fields.project || "未命名项目").trim();
     const mode = String(fields.mode || "mixed").trim();
     const outputName = String(fields.outputName || "").trim();
@@ -919,10 +969,10 @@ async function handleImportKnowledge(request, response) {
       return;
     }
 
-    const saved = await saveUploadedFiles(project, files);
+    const saved = await saveUploadedFiles(space, project, files);
     let result;
     if (dryRun) {
-      const documents = await loadUploadedDocuments(saved.savedFiles);
+      const documents = await loadUploadedDocuments(saved.savedFiles, saved.spaceRoot);
       const totalChars = documents.reduce((total, item) => total + item.content.length, 0);
       result = {
         stdout: [
@@ -936,9 +986,10 @@ async function handleImportKnowledge(request, response) {
         stderr: "",
       };
     } else {
-      const documents = await loadUploadedDocuments(saved.savedFiles);
+      const documents = await loadUploadedDocuments(saved.savedFiles, saved.spaceRoot);
       const organizedContent = await callOrganizationApi({ project, mode, documents });
       const written = await writeKnowledgeOutput({
+        spaceId: space,
         project,
         mode,
         outputName,
@@ -960,6 +1011,7 @@ async function handleImportKnowledge(request, response) {
     sendJson(response, 200, {
       ok: true,
       dryRun,
+      space,
       uploadDir: saved.uploadDir,
       savedFiles: saved.savedFiles,
       stdout: result.stdout.trim(),
@@ -970,6 +1022,38 @@ async function handleImportKnowledge(request, response) {
   } catch (error) {
     sendJson(response, 500, {
       error: "资料上传或整理失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleCreateSpace(request, response) {
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+
+  const rawName = String(payload.name || "").trim();
+  if (!rawName) {
+    sendJson(response, 400, { error: "项目库名称不能为空" });
+    return;
+  }
+  const name = normalizeSpaceId(rawName);
+
+  try {
+    const paths = await ensureKnowledgeBase(name);
+    sendJson(response, 200, {
+      ok: true,
+      space: {
+        id: name,
+        name,
+        root: paths.root,
+      },
+      spaces: await listSpaces(),
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "创建项目库失败",
       detail: error instanceof Error ? error.message : String(error),
     });
   }
@@ -1000,24 +1084,45 @@ async function serveStatic(request, response) {
 }
 
 const server = createServer(async (request, response) => {
-  if (request.method === "POST" && request.url === "/api/ask") {
+  const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/ask") {
     await handleAsk(request, response);
     return;
   }
 
-  if (request.method === "POST" && request.url === "/api/update-kb") {
+  if (request.method === "POST" && requestUrl.pathname === "/api/update-kb") {
     await handleUpdateKnowledge(request, response);
     return;
   }
 
-  if (request.method === "POST" && request.url === "/api/import-kb") {
+  if (request.method === "POST" && requestUrl.pathname === "/api/import-kb") {
     await handleImportKnowledge(request, response);
     return;
   }
 
-  if (request.method === "GET" && request.url === "/api/kb-status") {
+  if (request.method === "GET" && requestUrl.pathname === "/api/spaces") {
+    sendJson(response, 200, {
+      ok: true,
+      defaultSpace: DEFAULT_SPACE_ID,
+      spacesRoot: SPACES_ROOT,
+      spaces: await listSpaces(),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/spaces") {
+    await handleCreateSpace(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/kb-status") {
     try {
-      sendJson(response, 200, await getKnowledgeBaseStatus());
+      sendJson(
+        response,
+        200,
+        await getKnowledgeBaseStatus(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID)
+      );
     } catch (error) {
       sendJson(response, 500, {
         ok: false,
@@ -1028,16 +1133,20 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (request.method === "GET" && request.url === "/api/health") {
-    const status = await getKnowledgeBaseStatus();
+  if (request.method === "GET" && requestUrl.pathname === "/api/health") {
+    const status = await getKnowledgeBaseStatus(
+      requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID
+    );
     sendJson(response, 200, {
       ok: true,
-      knowledgeDir: KNOWLEDGE_DIR,
+      knowledgeDir: status.knowledgeDir,
       aiProvider: AI_PROVIDER,
       aiBaseUrl: AI_BASE_URL,
       aiModel: AI_MODEL,
       hasApiKey: Boolean(AI_API_KEY),
       vaultDir: VAULT_DIR,
+      spacesRoot: SPACES_ROOT,
+      space: status.spaceId,
       updateScript: UPDATE_SCRIPT,
       counts: status.counts,
       latestUpdate: status.latestUpdate,
@@ -1054,9 +1163,9 @@ const server = createServer(async (request, response) => {
   response.end("Method not allowed");
 });
 
-await ensureKnowledgeBase();
+await ensureKnowledgeBase(DEFAULT_SPACE_ID);
 
 server.listen(PORT, () => {
   console.log(`知识库网页已启动：http://localhost:${PORT}`);
-  console.log(`知识库目录：${KNOWLEDGE_DIR}`);
+  console.log(`知识库总目录：${SPACES_ROOT}`);
 });

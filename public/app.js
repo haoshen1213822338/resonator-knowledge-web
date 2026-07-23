@@ -11,6 +11,10 @@ const kbOutputName = document.querySelector("#kb-output-name");
 const kbDryRun = document.querySelector("#kb-dry-run");
 const kbUpdate = document.querySelector("#kb-update");
 const kbStatus = document.querySelector("#kb-status");
+const spaceSelect = document.querySelector("#space-select");
+const newSpaceName = document.querySelector("#new-space-name");
+const createSpace = document.querySelector("#create-space");
+const spaceMessage = document.querySelector("#space-message");
 const vaultState = document.querySelector("#vault-state");
 const aiFileCount = document.querySelector("#ai-file-count");
 const rawFileCount = document.querySelector("#raw-file-count");
@@ -287,13 +291,83 @@ function formatLatestUpdate(value) {
   });
 }
 
+function getCurrentSpace() {
+  return spaceSelect.value || localStorage.getItem("currentKnowledgeSpace") || "";
+}
+
+function setSpaceMessage(message, type = "") {
+  spaceMessage.className = type ? `space-message ${type}` : "space-message";
+  spaceMessage.textContent = message;
+}
+
+function renderSpaces(spaces, selectedSpace) {
+  spaceSelect.innerHTML = spaces
+    .map((space) => {
+      const selected = space.id === selectedSpace ? "selected" : "";
+      return `<option value="${space.id}" ${selected}>${space.name}</option>`;
+    })
+    .join("");
+}
+
+async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledgeSpace")) {
+  const response = await fetch("/api/spaces");
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "项目库列表读取失败");
+  }
+
+  const spaces = payload.spaces || [];
+  const selected = spaces.some((space) => space.id === preferredSpace)
+    ? preferredSpace
+    : payload.defaultSpace || spaces[0]?.id || "";
+  renderSpaces(spaces, selected);
+  if (selected) {
+    spaceSelect.value = selected;
+    localStorage.setItem("currentKnowledgeSpace", selected);
+  }
+}
+
+async function createKnowledgeSpace() {
+  const name = newSpaceName.value.trim();
+  if (!name) {
+    setSpaceMessage("请输入项目库名称。", "error");
+    return;
+  }
+
+  createSpace.disabled = true;
+  setSpaceMessage("正在创建项目库...");
+  try {
+    const response = await fetch("/api/spaces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || "项目库创建失败");
+    }
+
+    await loadSpaces(payload.space.id);
+    newSpaceName.value = "";
+    setSpaceMessage(`已创建并切换到：${payload.space.name}`, "success");
+    await loadKnowledgeStatus();
+  } catch (error) {
+    setSpaceMessage(
+      error instanceof Error ? error.message : "项目库创建失败。",
+      "error"
+    );
+  } finally {
+    createSpace.disabled = false;
+  }
+}
+
 function renderKnowledgeStatus(status) {
   vaultState.textContent = status.ok ? "已初始化" : "异常";
   aiFileCount.textContent = `${status.counts?.aiFiles ?? 0} 个`;
   rawFileCount.textContent = `${status.counts?.rawFiles ?? 0} 个`;
   apiState.textContent = status.hasApiKey ? "已连接" : "未配置";
   kbPath.textContent = [
-    `仓库：${status.vaultDir}`,
+    `当前项目库：${status.spaceRoot}`,
     `最近更新：${formatLatestUpdate(status.latestUpdate)}`,
   ].join("  ·  ");
 }
@@ -302,7 +376,8 @@ async function loadKnowledgeStatus() {
   try {
     vaultState.textContent = "检查中";
     apiState.textContent = "检查中";
-    const response = await fetch("/api/kb-status");
+    const space = getCurrentSpace();
+    const response = await fetch(`/api/kb-status?space=${encodeURIComponent(space)}`);
     const status = await response.json();
     if (!response.ok) {
       throw new Error(status.detail || status.error || "状态检查失败");
@@ -339,6 +414,7 @@ async function runKnowledgeUpdate(dryRun) {
 
   try {
     const formData = new FormData();
+    formData.append("space", getCurrentSpace());
     formData.append("project", kbProject.value.trim());
     formData.append("mode", kbMode.value);
     formData.append("outputName", kbOutputName.value.trim());
@@ -396,10 +472,23 @@ sampleButton.addEventListener("click", () => {
   questionInput.focus();
 });
 
+spaceSelect.addEventListener("change", async () => {
+  localStorage.setItem("currentKnowledgeSpace", getCurrentSpace());
+  setSpaceMessage(`已切换到：${getCurrentSpace()}`, "success");
+  await loadKnowledgeStatus();
+});
+createSpace.addEventListener("click", createKnowledgeSpace);
 refreshStatus.addEventListener("click", loadKnowledgeStatus);
 kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));
-loadKnowledgeStatus();
+loadSpaces()
+  .then(loadKnowledgeStatus)
+  .catch((error) => {
+    setSpaceMessage(
+      error instanceof Error ? error.message : "项目库初始化失败。",
+      "error"
+    );
+  });
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -414,7 +503,7 @@ form.addEventListener("submit", async (event) => {
     const response = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, space: getCurrentSpace() }),
     });
     const payload = await response.json();
 
