@@ -54,6 +54,46 @@
         </form>
       </section>
 
+      <section class="update-panel" aria-labelledby="update-title">
+        <div class="section-label" id="update-title">知识库更新</div>
+        <div class="update-grid">
+          <label>
+            <span>项目名称</span>
+            <input id="kb-project" value="梦星鸣潮" />
+          </label>
+          <label>
+            <span>资料路径</span>
+            <input
+              id="kb-input"
+              value="00_原始资料\候选材料包\流程测试_梦星鸣潮_每日返图"
+            />
+          </label>
+          <label>
+            <span>整理类型</span>
+            <select id="kb-mode">
+              <option value="mixed">综合整理</option>
+              <option value="faq">FAQ</option>
+              <option value="sop">SOP</option>
+              <option value="analysis">项目分析</option>
+              <option value="project">项目资料</option>
+            </select>
+          </label>
+          <label>
+            <span>输出文件名</span>
+            <input id="kb-output-name" placeholder="不填则自动生成" />
+          </label>
+        </div>
+        <div class="update-actions">
+          <button type="button" class="ghost-button" id="kb-dry-run">
+            预检查
+          </button>
+          <button type="button" class="primary-button" id="kb-update">
+            更新知识库
+          </button>
+        </div>
+        <pre id="kb-status" class="update-status">等待更新任务。</pre>
+      </section>
+
       <section class="answer-layout">
         <article class="answer-panel" aria-live="polite">
           <div class="section-label">回答</div>

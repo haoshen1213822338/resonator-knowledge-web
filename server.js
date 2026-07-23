@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -19,6 +20,13 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || "https://api.deepseek.com")
 const AI_API_KEY = process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "";
 const AI_MODEL = process.env.AI_MODEL || "deepseek-v4-flash";
 const PUBLIC_DIR = path.join(__dirname, "public");
+const VAULT_DIR = process.env.VAULT_DIR || path.dirname(KNOWLEDGE_DIR);
+const UPDATE_SCRIPT = process.env.UPDATE_SCRIPT ||
+  path.join(VAULT_DIR, "99_系统配置", "scripts", "update_kb.py");
+const PYTHON_CMD = process.env.PYTHON_CMD || "python";
+const DEFAULT_UPDATE_INPUT =
+  process.env.DEFAULT_UPDATE_INPUT ||
+  "00_原始资料\\候选材料包\\流程测试_梦星鸣潮_每日返图";
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -377,6 +385,126 @@ async function handleAsk(request, response) {
   }
 }
 
+async function readRequestJson(request, response) {
+  let body = "";
+  for await (const chunk of request) {
+    body += chunk;
+    if (body.length > 1_000_000) {
+      sendJson(response, 413, { error: "请求过大" });
+      return null;
+    }
+  }
+
+  try {
+    return JSON.parse(body || "{}");
+  } catch {
+    sendJson(response, 400, { error: "请求格式不是有效 JSON" });
+    return null;
+  }
+}
+
+function runUpdateScript({ input, project, mode, outputName, dryRun }) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      UPDATE_SCRIPT,
+      "--vault",
+      VAULT_DIR,
+      "--input",
+      input,
+      "--project",
+      project,
+      "--mode",
+      mode,
+    ];
+
+    if (outputName) {
+      args.push("--output-name", outputName);
+    }
+    if (dryRun) {
+      args.push("--dry-run");
+    }
+
+    const child = spawn(PYTHON_CMD, args, {
+      cwd: VAULT_DIR,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+      },
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("知识库更新超时，请减少资料量后重试。"));
+    }, 180_000);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      reject(new Error(stderr || stdout || `更新脚本退出码：${code}`));
+    });
+  });
+}
+
+async function handleUpdateKnowledge(request, response) {
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+
+  const project = String(payload.project || "梦星鸣潮").trim();
+  const input = String(payload.input || DEFAULT_UPDATE_INPUT).trim();
+  const mode = String(payload.mode || "mixed").trim();
+  const outputName = String(payload.outputName || "").trim();
+  const dryRun = Boolean(payload.dryRun);
+
+  if (!project || !input) {
+    sendJson(response, 400, { error: "项目名称和资料路径不能为空" });
+    return;
+  }
+
+  if (!["project", "faq", "sop", "analysis", "mixed"].includes(mode)) {
+    sendJson(response, 400, { error: "整理类型不支持" });
+    return;
+  }
+
+  try {
+    const result = await runUpdateScript({
+      input,
+      project,
+      mode,
+      outputName,
+      dryRun,
+    });
+    sendJson(response, 200, {
+      ok: true,
+      dryRun,
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim(),
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "知识库更新失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function serveStatic(request, response) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const safePath = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
@@ -407,6 +535,11 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && request.url === "/api/update-kb") {
+    await handleUpdateKnowledge(request, response);
+    return;
+  }
+
   if (request.method === "GET" && request.url === "/api/health") {
     sendJson(response, 200, {
       ok: true,
@@ -415,6 +548,8 @@ const server = createServer(async (request, response) => {
       aiBaseUrl: AI_BASE_URL,
       aiModel: AI_MODEL,
       hasApiKey: Boolean(AI_API_KEY),
+      vaultDir: VAULT_DIR,
+      updateScript: UPDATE_SCRIPT,
     });
     return;
   }

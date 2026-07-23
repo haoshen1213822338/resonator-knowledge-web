@@ -4,6 +4,13 @@ const answerBox = document.querySelector("#answer");
 const sourcesBox = document.querySelector("#sources");
 const sampleButton = document.querySelector("#sample-button");
 const canvas = document.querySelector("#resonance-canvas");
+const kbProject = document.querySelector("#kb-project");
+const kbInput = document.querySelector("#kb-input");
+const kbMode = document.querySelector("#kb-mode");
+const kbOutputName = document.querySelector("#kb-output-name");
+const kbDryRun = document.querySelector("#kb-dry-run");
+const kbUpdate = document.querySelector("#kb-update");
+const kbStatus = document.querySelector("#kb-status");
 
 const root = document.documentElement;
 const pointer = {
@@ -96,7 +103,7 @@ function createResonanceField() {
   let height = 0;
   let ratio = 1;
   let animationId = 0;
-  let start = performance.now();
+  const start = performance.now();
 
   function resize() {
     ratio = Math.min(window.devicePixelRatio || 1, 2);
@@ -262,6 +269,50 @@ function createResonanceField() {
   };
 }
 
+function setUpdateLoading(message) {
+  kbStatus.className = "update-status";
+  kbStatus.textContent = message;
+  kbDryRun.disabled = true;
+  kbUpdate.disabled = true;
+}
+
+function setUpdateIdle() {
+  kbDryRun.disabled = false;
+  kbUpdate.disabled = false;
+}
+
+async function runKnowledgeUpdate(dryRun) {
+  setUpdateLoading(dryRun ? "正在预检查资料..." : "正在更新知识库，可能需要几十秒...");
+
+  try {
+    const response = await fetch("/api/update-kb", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project: kbProject.value.trim(),
+        input: kbInput.value.trim(),
+        mode: kbMode.value,
+        outputName: kbOutputName.value.trim(),
+        dryRun,
+      }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || "更新失败");
+    }
+
+    kbStatus.className = "update-status success";
+    kbStatus.textContent = payload.stdout || "更新完成。";
+  } catch (error) {
+    kbStatus.className = "update-status error";
+    kbStatus.textContent =
+      error instanceof Error ? error.message : "更新失败，请检查资料路径。";
+  } finally {
+    setUpdateIdle();
+  }
+}
+
 window.addEventListener("pointermove", updatePointer, { passive: true });
 window.addEventListener(
   "resize",
@@ -285,6 +336,9 @@ sampleButton.addEventListener("click", () => {
   questionInput.value = "梦星鸣潮每日返图传哪里？";
   questionInput.focus();
 });
+
+kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
+kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
