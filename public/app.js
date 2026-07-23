@@ -15,6 +15,10 @@ const spaceSelect = document.querySelector("#space-select");
 const newSpaceName = document.querySelector("#new-space-name");
 const createSpace = document.querySelector("#create-space");
 const spaceMessage = document.querySelector("#space-message");
+const vaultPanel = document.querySelector("#vault-panel");
+const vaultPath = document.querySelector("#vault-path");
+const initVault = document.querySelector("#init-vault");
+const vaultMessage = document.querySelector("#vault-message");
 const vaultState = document.querySelector("#vault-state");
 const aiFileCount = document.querySelector("#ai-file-count");
 const rawFileCount = document.querySelector("#raw-file-count");
@@ -300,6 +304,11 @@ function setSpaceMessage(message, type = "") {
   spaceMessage.textContent = message;
 }
 
+function setVaultMessage(message, type = "") {
+  vaultMessage.className = type ? `vault-message ${type}` : "vault-message";
+  vaultMessage.textContent = message;
+}
+
 function renderSpaces(spaces, selectedSpace) {
   spaceSelect.innerHTML = spaces
     .map((space) => {
@@ -361,7 +370,48 @@ async function createKnowledgeSpace() {
   }
 }
 
+async function initializeVaultPath() {
+  const nextPath = vaultPath.value.trim();
+  if (!nextPath) {
+    setVaultMessage("请输入要作为 Obsidian 总仓库的本地路径。", "error");
+    return;
+  }
+
+  initVault.disabled = true;
+  setVaultMessage("正在初始化本地知识库路径...");
+  try {
+    const response = await fetch("/api/vault-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vaultDir: nextPath }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || "知识库路径初始化失败");
+    }
+
+    localStorage.setItem("currentKnowledgeSpace", payload.status.spaceId);
+    await loadSpaces(payload.status.spaceId);
+    await loadKnowledgeStatus();
+    setVaultMessage(
+      `已切换到：${payload.vaultDir}。请在 Obsidian 中打开这个文件夹。`,
+      "success"
+    );
+  } catch (error) {
+    setVaultMessage(
+      error instanceof Error ? error.message : "知识库路径初始化失败。",
+      "error"
+    );
+  } finally {
+    initVault.disabled = false;
+  }
+}
+
 function renderKnowledgeStatus(status) {
+  vaultPanel.classList.toggle("hidden", !status.canConfigureVault);
+  if (status.canConfigureVault) {
+    vaultPath.value = status.vaultDir || "";
+  }
   vaultState.textContent = status.ok ? "已初始化" : "异常";
   aiFileCount.textContent = `${status.counts?.aiFiles ?? 0} 个`;
   rawFileCount.textContent = `${status.counts?.rawFiles ?? 0} 个`;
@@ -486,6 +536,7 @@ spaceSelect.addEventListener("change", async () => {
   await loadKnowledgeStatus();
 });
 createSpace.addEventListener("click", createKnowledgeSpace);
+initVault.addEventListener("click", initializeVaultPath);
 refreshStatus.addEventListener("click", loadKnowledgeStatus);
 kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));

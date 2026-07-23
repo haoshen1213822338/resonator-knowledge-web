@@ -380,6 +380,7 @@ h1 {
 .source-panel,
 .space-panel,
 .status-panel,
+.vault-panel,
 .update-panel {
   position: relative;
   overflow: hidden;
@@ -402,6 +403,7 @@ h1 {
 .source-panel::before,
 .space-panel::before,
 .status-panel::before,
+.vault-panel::before,
 .update-panel::before {
   content: "";
   position: absolute;
@@ -411,6 +413,50 @@ h1 {
     radial-gradient(ellipse at var(--pointer-x) var(--pointer-y), rgba(217, 184, 255, 0.18), transparent 18rem),
     linear-gradient(135deg, rgba(255, 255, 255, 0.09), transparent 42%);
   opacity: 0.78;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.vault-panel {
+  width: min(960px, 100%);
+  margin: 0 auto 18px;
+  padding: 18px;
+  border-color: rgba(255, 213, 74, 0.28);
+}
+
+.vault-control {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.vault-control label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 720;
+}
+
+.vault-message {
+  position: relative;
+  z-index: 1;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.vault-message.success {
+  color: #dfffe9;
+}
+
+.vault-message.error {
+  color: var(--warning);
 }
 
 .space-panel {
@@ -854,6 +900,10 @@ button:disabled {
   }
 
   .space-control {
+    grid-template-columns: 1fr;
+  }
+
+  .vault-control {
     grid-template-columns: 1fr;
   }
 

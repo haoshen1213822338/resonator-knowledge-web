@@ -9,6 +9,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 await loadEnvFile(path.join(__dirname, ".env"));
+const LOCAL_CONFIG_PATH = path.join(__dirname, "config.local.json");
+const LOCAL_CONFIG = await loadLocalConfig();
 
 const PORT = Number(process.env.PORT || 3030);
 const KNOWLEDGE_DIR =
@@ -20,11 +22,11 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || "https://api.deepseek.com")
 const AI_API_KEY = process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "";
 const AI_MODEL = process.env.AI_MODEL || "deepseek-v4-flash";
 const PUBLIC_DIR = path.join(__dirname, "public");
-const VAULT_DIR = process.env.VAULT_DIR || path.dirname(KNOWLEDGE_DIR);
-const SPACES_ROOT =
-  process.env.SPACES_ROOT || path.join(VAULT_DIR, "knowledge_spaces");
+let VAULT_DIR = LOCAL_CONFIG.vaultDir || process.env.VAULT_DIR || path.dirname(KNOWLEDGE_DIR);
+let SPACES_ROOT =
+  LOCAL_CONFIG.spacesRoot || process.env.SPACES_ROOT || path.join(VAULT_DIR, "knowledge_spaces");
 const DEFAULT_SPACE_ID = process.env.DEFAULT_SPACE_ID || "共振体公司知识库";
-const UPDATE_SCRIPT = process.env.UPDATE_SCRIPT ||
+let UPDATE_SCRIPT = process.env.UPDATE_SCRIPT ||
   path.join(VAULT_DIR, "99_系统配置", "scripts", "update_kb.py");
 const PYTHON_CMD = process.env.PYTHON_CMD || "python";
 const DEFAULT_UPDATE_INPUT =
@@ -69,6 +71,37 @@ async function loadEnvFile(envPath) {
   }
 }
 
+async function loadLocalConfig() {
+  try {
+    const content = await readFile(LOCAL_CONFIG_PATH, "utf8");
+    return JSON.parse(content);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return {};
+    }
+    throw error;
+  }
+}
+
+async function saveLocalConfig(config) {
+  await writeFile(LOCAL_CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
+}
+
+function isLocalRequest(request) {
+  const host = String(request.headers.host || "").split(":")[0].toLowerCase();
+  const remoteAddress = request.socket.remoteAddress || "";
+  return [
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "::ffff:127.0.0.1",
+  ].includes(host) || [
+    "127.0.0.1",
+    "::1",
+    "::ffff:127.0.0.1",
+  ].includes(remoteAddress);
+}
+
 function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
@@ -91,6 +124,15 @@ async function pathExists(targetPath) {
 function normalizeSpaceId(value) {
   const normalized = safePathSegment(value || DEFAULT_SPACE_ID);
   return normalized || DEFAULT_SPACE_ID;
+}
+
+function setVaultDirectory(vaultDir) {
+  VAULT_DIR = path.resolve(String(vaultDir));
+  SPACES_ROOT =
+    LOCAL_CONFIG.spacesRoot || process.env.SPACES_ROOT || path.join(VAULT_DIR, "knowledge_spaces");
+  if (!process.env.UPDATE_SCRIPT) {
+    UPDATE_SCRIPT = path.join(VAULT_DIR, "99_系统配置", "scripts", "update_kb.py");
+  }
 }
 
 function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
@@ -1059,6 +1101,44 @@ async function handleCreateSpace(request, response) {
   }
 }
 
+async function handleVaultConfig(request, response) {
+  if (!isLocalRequest(request)) {
+    sendJson(response, 403, { error: "只有部署电脑本机可以修改知识库路径" });
+    return;
+  }
+
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+
+  const vaultDir = String(payload.vaultDir || "").trim();
+  if (!vaultDir) {
+    sendJson(response, 400, { error: "请输入本地知识库路径" });
+    return;
+  }
+
+  try {
+    setVaultDirectory(vaultDir);
+    LOCAL_CONFIG.vaultDir = VAULT_DIR;
+    LOCAL_CONFIG.updatedAt = new Date().toISOString();
+    await saveLocalConfig(LOCAL_CONFIG);
+    await ensureKnowledgeBase(DEFAULT_SPACE_ID);
+    sendJson(response, 200, {
+      ok: true,
+      vaultDir: VAULT_DIR,
+      spacesRoot: SPACES_ROOT,
+      spaces: await listSpaces(),
+      status: await getKnowledgeBaseStatus(DEFAULT_SPACE_ID),
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "初始化知识库路径失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function serveStatic(request, response) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const safePath = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
@@ -1118,11 +1198,13 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "GET" && requestUrl.pathname === "/api/kb-status") {
     try {
-      sendJson(
-        response,
-        200,
-        await getKnowledgeBaseStatus(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID)
+      const status = await getKnowledgeBaseStatus(
+        requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID
       );
+      sendJson(response, 200, {
+        ...status,
+        canConfigureVault: isLocalRequest(request),
+      });
     } catch (error) {
       sendJson(response, 500, {
         ok: false,
@@ -1130,6 +1212,11 @@ const server = createServer(async (request, response) => {
         detail: error instanceof Error ? error.message : String(error),
       });
     }
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/vault-config") {
+    await handleVaultConfig(request, response);
     return;
   }
 

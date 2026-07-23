@@ -54,6 +54,20 @@
         </form>
       </section>
 
+      <section class="vault-panel hidden" id="vault-panel" aria-labelledby="vault-title">
+        <div class="section-label" id="vault-title">本机知识库路径</div>
+        <div class="vault-control">
+          <label>
+            <span>Obsidian 总仓库路径</span>
+            <input id="vault-path" placeholder="例如：D:\公司知识库" />
+          </label>
+          <button type="button" class="primary-button compact-button" id="init-vault">
+            初始化并切换
+          </button>
+        </div>
+        <p id="vault-message" class="vault-message">仅部署电脑本机可见。初始化后，网页和 Obsidian 共用这个文件夹。</p>
+      </section>
+
       <section class="space-panel" aria-labelledby="space-title">
         <div class="section-label" id="space-title">当前项目库</div>
         <div class="space-control">
