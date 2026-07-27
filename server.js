@@ -201,6 +201,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
   const uploadRoot = path.join(rawDir, "网页上传");
   const knowledgeDir = path.join(root, "90_AI输出");
   const systemDir = path.join(root, "99_系统配置");
+  const chatDir = path.join(systemDir, "chat_sessions");
   const updateLogDir = path.join(systemDir, "update_logs");
   const importIndex = path.join(systemDir, "资料入库记录.md");
   return {
@@ -210,6 +211,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
     uploadRoot,
     knowledgeDir,
     systemDir,
+    chatDir,
     updateLogDir,
     importIndex,
     folders: [
@@ -217,6 +219,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
       uploadRoot,
       knowledgeDir,
       systemDir,
+      chatDir,
       path.join(systemDir, "scripts"),
       updateLogDir,
     ],
@@ -360,7 +363,30 @@ function extractChatCompletionText(payload) {
   return payload.choices?.[0]?.message?.content?.trim() || "";
 }
 
-async function callResponsesApi(question, results, instructions, knowledgeContext) {
+function buildConversationHistory(history = []) {
+  return history
+    .slice(-8)
+    .filter((item) => ["user", "assistant"].includes(item.role) && item.content)
+    .map((item) => ({
+      role: item.role,
+      content: String(item.content).slice(0, 1800),
+    }));
+}
+
+function buildHistoryText(history = []) {
+  const usableHistory = buildConversationHistory(history);
+  if (!usableHistory.length) {
+    return "无";
+  }
+  return usableHistory
+    .map((item, index) => {
+      const label = item.role === "user" ? "用户" : "助手";
+      return `${index + 1}. ${label}：${item.content}`;
+    })
+    .join("\n");
+}
+
+async function callResponsesApi(question, results, instructions, knowledgeContext, history = []) {
   const apiResponse = await fetch(`${AI_BASE_URL}/responses`, {
     method: "POST",
     headers: {
@@ -377,6 +403,9 @@ async function callResponsesApi(question, results, instructions, knowledgeContex
             {
               type: "input_text",
               text: [
+                "上一轮对话记录：",
+                buildHistoryText(history),
+                "",
                 `问题：${question}`,
                 "",
                 "本地知识库片段：",
@@ -398,7 +427,11 @@ async function callResponsesApi(question, results, instructions, knowledgeContex
   return extractResponsesApiText(payload) || "AI 没有返回可用文本。";
 }
 
-async function callChatCompletionsApi(question, results, instructions, knowledgeContext) {
+async function callChatCompletionsApi(question, results, instructions, knowledgeContext, history = []) {
+  const historyMessages = buildConversationHistory(history).map((item) => ({
+    role: item.role,
+    content: item.content,
+  }));
   const apiResponse = await fetch(`${AI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
@@ -409,6 +442,7 @@ async function callChatCompletionsApi(question, results, instructions, knowledge
       model: AI_MODEL,
       messages: [
         { role: "system", content: instructions },
+        ...historyMessages,
         {
           role: "user",
           content: [
@@ -432,7 +466,7 @@ async function callChatCompletionsApi(question, results, instructions, knowledge
   return extractChatCompletionText(payload) || "AI 没有返回可用文本。";
 }
 
-async function callAI(question, results) {
+async function callAI(question, results, history = []) {
   if (!AI_API_KEY) {
     return null;
   }
@@ -443,15 +477,17 @@ async function callAI(question, results) {
     "只能根据提供的本地知识库片段回答。",
     "如果资料不足，直接说资料不足，不要编造。",
     "回答要简洁、可执行，适合客服、管理员或接单人员直接使用。",
+    "你可以结合上一轮对话理解追问、省略指代和连续任务。",
+    "但事实依据仍然必须来自本地知识库片段；如果片段不足，要说明资料不足。",
     "不要输出手机号、订单号、账号、密码、验证码等敏感信息。",
     "最后用“参考：文件名”列出用到的知识文件。",
   ].join("\n");
 
   if (AI_PROVIDER === "openai-responses") {
-    return callResponsesApi(question, results, instructions, knowledgeContext);
+    return callResponsesApi(question, results, instructions, knowledgeContext, history);
   }
 
-  return callChatCompletionsApi(question, results, instructions, knowledgeContext);
+  return callChatCompletionsApi(question, results, instructions, knowledgeContext, history);
 }
 
 function buildOrganizationInstructions(mode) {
@@ -610,6 +646,156 @@ function getOutputFileName(project, outputName) {
 
   const date = new Date().toISOString().slice(0, 10);
   return `${safePathSegment(project)}_资料整理_${date}.md`;
+}
+
+function createSessionId() {
+  return `chat_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+}
+
+function normalizeSessionId(value) {
+  return safePathSegment(value || createSessionId()).slice(0, 120);
+}
+
+function getChatSessionPath(spaceId, sessionId) {
+  const paths = getSpacePaths(spaceId);
+  return path.join(paths.chatDir, `${normalizeSessionId(sessionId)}.json`);
+}
+
+function createEmptySession(spaceId, title = "新对话") {
+  const now = new Date().toISOString();
+  return {
+    id: createSessionId(),
+    space: normalizeSpaceId(spaceId),
+    title: String(title || "新对话").trim().slice(0, 40) || "新对话",
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+  };
+}
+
+async function readChatSession(spaceId, sessionId) {
+  await ensureKnowledgeBase(spaceId);
+  const sessionPath = getChatSessionPath(spaceId, sessionId);
+  try {
+    const content = await readFile(sessionPath, "utf8");
+    const session = JSON.parse(content);
+    return {
+      ...session,
+      id: normalizeSessionId(session.id || sessionId),
+      space: normalizeSpaceId(session.space || spaceId),
+      messages: Array.isArray(session.messages) ? session.messages : [],
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function writeChatSession(spaceId, session) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const normalizedSession = {
+    ...session,
+    id: normalizeSessionId(session.id),
+    space: normalizeSpaceId(spaceId),
+    updatedAt: new Date().toISOString(),
+    messages: Array.isArray(session.messages) ? session.messages : [],
+  };
+  const sessionPath = path.join(paths.chatDir, `${normalizedSession.id}.json`);
+  await writeFile(sessionPath, JSON.stringify(normalizedSession, null, 2), "utf8");
+  return normalizedSession;
+}
+
+async function listChatSessions(spaceId = DEFAULT_SPACE_ID) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const entries = await readdir(paths.chatDir, { withFileTypes: true });
+  const sessions = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".json") {
+      continue;
+    }
+    try {
+      const content = await readFile(path.join(paths.chatDir, entry.name), "utf8");
+      const session = JSON.parse(content);
+      sessions.push({
+        id: normalizeSessionId(session.id || path.basename(entry.name, ".json")),
+        title: session.title || "未命名对话",
+        createdAt: session.createdAt || "",
+        updatedAt: session.updatedAt || "",
+        messageCount: Array.isArray(session.messages) ? session.messages.length : 0,
+      });
+    } catch {
+      // Ignore broken session files so one damaged history does not block the app.
+    }
+  }
+  return sessions.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+function buildSessionTitle(question) {
+  return String(question || "新对话")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 28) || "新对话";
+}
+
+async function handleListChatSessions(request, response) {
+  const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  try {
+    sendJson(response, 200, {
+      ok: true,
+      space,
+      sessions: await listChatSessions(space),
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "读取历史对话失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleGetChatSession(request, response) {
+  const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  const sessionId = normalizeSessionId(requestUrl.searchParams.get("session") || "");
+  try {
+    const session = await readChatSession(space, sessionId);
+    if (!session) {
+      sendJson(response, 404, { error: "没有找到这个历史对话" });
+      return;
+    }
+    sendJson(response, 200, { ok: true, session });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "读取历史对话失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleCreateChatSession(request, response) {
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  try {
+    const session = await writeChatSession(
+      space,
+      createEmptySession(space, payload.title || "新对话")
+    );
+    sendJson(response, 200, { ok: true, session });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "新建对话失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 const MODE_LABELS = {
@@ -1120,38 +1306,60 @@ function buildDraftAnswer(question, results) {
 }
 
 async function handleAsk(request, response) {
-  let body = "";
-  for await (const chunk of request) {
-    body += chunk;
-    if (body.length > 1_000_000) {
-      sendJson(response, 413, { error: "请求过大" });
-      return;
-    }
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(body || "{}");
-  } catch {
-    sendJson(response, 400, { error: "请求格式不是有效 JSON" });
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
     return;
   }
 
   const question = String(payload.question || "").trim();
   const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  const requestedSessionId = payload.sessionId ? normalizeSessionId(payload.sessionId) : "";
   if (!question) {
     sendJson(response, 400, { error: "请输入问题" });
     return;
   }
 
   try {
+    let session = requestedSessionId
+      ? await readChatSession(space, requestedSessionId)
+      : null;
+    if (!session) {
+      session = createEmptySession(space, buildSessionTitle(question));
+    }
+    if (!session.title || session.title === "新对话") {
+      session.title = buildSessionTitle(question);
+    }
+
+    const previousMessages = session.messages || [];
     const results = await searchKnowledge(question, space);
-    const aiAnswer = await callAI(question, results);
+    const aiAnswer = await callAI(question, results, previousMessages);
+    const answer = aiAnswer || buildDraftAnswer(question, results);
+    const now = new Date().toISOString();
+    session.messages = [
+      ...previousMessages,
+      {
+        id: `${session.id}_u_${previousMessages.length + 1}`,
+        role: "user",
+        content: question,
+        createdAt: now,
+      },
+      {
+        id: `${session.id}_a_${previousMessages.length + 2}`,
+        role: "assistant",
+        content: answer,
+        citations: results,
+        mode: aiAnswer ? "ai" : "local-search",
+        createdAt: new Date().toISOString(),
+      },
+    ].slice(-80);
+    session = await writeChatSession(space, session);
+
     sendJson(response, 200, {
-      answer: aiAnswer || buildDraftAnswer(question, results),
+      answer,
       citations: results,
       mode: aiAnswer ? "ai" : "local-search",
       space,
+      session,
     });
   } catch (error) {
     sendJson(response, 500, {
@@ -1593,6 +1801,21 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "POST" && requestUrl.pathname === "/api/ask") {
     await handleAsk(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/chat-sessions") {
+    await handleListChatSessions(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/chat-session") {
+    await handleGetChatSession(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/chat-session") {
+    await handleCreateChatSession(request, response);
     return;
   }
 

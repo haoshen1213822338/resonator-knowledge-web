@@ -74,13 +74,28 @@
 
       <section class="answer-layout">
         <article class="answer-panel" aria-live="polite">
-          <div class="section-label">回答</div>
-          <div id="answer" class="answer empty">等待你的问题。</div>
+          <div class="chat-header">
+            <div>
+              <div class="section-label">Agent 对话</div>
+              <p id="chat-title" class="chat-title">新对话</p>
+            </div>
+            <button type="button" class="ghost-button compact-button" id="new-chat">
+              新建对话
+            </button>
+          </div>
+          <div id="conversation" class="conversation empty">等待你的问题。</div>
+          <div id="answer" class="answer hidden"></div>
         </article>
 
         <aside class="source-panel">
-          <div class="section-label">引用来源</div>
-          <div id="sources" class="sources empty">搜索到的知识文件会显示在这里。</div>
+          <div class="side-section">
+            <div class="section-label">历史对话</div>
+            <div id="chat-sessions" class="chat-sessions empty">暂无历史对话。</div>
+          </div>
+          <div class="side-section">
+            <div class="section-label">引用来源</div>
+            <div id="sources" class="sources empty">搜索到的知识文件会显示在这里。</div>
+          </div>
         </aside>
       </section>
 

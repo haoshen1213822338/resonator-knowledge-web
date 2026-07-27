@@ -2,6 +2,10 @@ const form = document.querySelector("#ask-form");
 const questionInput = document.querySelector("#question");
 const answerBox = document.querySelector("#answer");
 const sourcesBox = document.querySelector("#sources");
+const conversationBox = document.querySelector("#conversation");
+const chatSessionsBox = document.querySelector("#chat-sessions");
+const chatTitle = document.querySelector("#chat-title");
+const newChatButton = document.querySelector("#new-chat");
 const sampleButton = document.querySelector("#sample-button");
 const canvas = document.querySelector("#resonance-canvas");
 const kbProject = document.querySelector("#kb-project");
@@ -36,6 +40,8 @@ const toggleImportPanel = document.querySelector("#toggle-import-panel");
 const toggleManagePanel = document.querySelector("#toggle-manage-panel");
 
 const root = document.documentElement;
+let currentSessionId = localStorage.getItem("currentChatSessionId") || "";
+let currentMessages = [];
 const pointer = {
   x: window.innerWidth / 2,
   y: window.innerHeight * 0.35,
@@ -43,10 +49,68 @@ const pointer = {
 const smoothPointer = { ...pointer };
 
 function setLoading() {
-  answerBox.className = "answer";
-  answerBox.textContent = "正在搜索本地知识库，并交给 AI 总结...";
+  renderConversation([
+    ...currentMessages,
+    {
+      role: "assistant",
+      content: "正在搜索本地知识库，并交给 AI 总结...",
+      pending: true,
+    },
+  ]);
   sourcesBox.className = "sources empty";
   sourcesBox.textContent = "正在查找引用来源。";
+}
+
+function renderConversation(messages = currentMessages) {
+  if (!messages.length) {
+    conversationBox.className = "conversation empty";
+    conversationBox.textContent = "等待你的问题。";
+    return;
+  }
+
+  conversationBox.className = "conversation";
+  conversationBox.innerHTML = messages
+    .map((message) => {
+      const roleLabel = message.role === "user" ? "你" : "Agent";
+      const pendingClass = message.pending ? " pending" : "";
+      return `
+        <div class="chat-message ${message.role}${pendingClass}">
+          <div class="message-role">${roleLabel}</div>
+          <div class="message-content">${escapeHtml(message.content)}</div>
+        </div>
+      `;
+    })
+    .join("");
+  conversationBox.scrollTop = conversationBox.scrollHeight;
+}
+
+function renderChatSessions(sessions = []) {
+  if (!sessions.length) {
+    chatSessionsBox.className = "chat-sessions empty";
+    chatSessionsBox.textContent = "暂无历史对话。";
+    return;
+  }
+
+  chatSessionsBox.className = "chat-sessions";
+  chatSessionsBox.innerHTML = sessions
+    .map((session) => {
+      const active = session.id === currentSessionId ? " active" : "";
+      const updatedAt = session.updatedAt
+        ? new Date(session.updatedAt).toLocaleString("zh-CN", {
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "";
+      return `
+        <button type="button" class="chat-session${active}" data-session-id="${escapeHtml(session.id)}">
+          <span>${escapeHtml(session.title || "未命名对话")}</span>
+          <small>${updatedAt} · ${session.messageCount || 0} 条</small>
+        </button>
+      `;
+    })
+    .join("");
 }
 
 function renderSources(citations) {
@@ -417,6 +481,65 @@ function openUtilityPanel(panel) {
   panel.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+function resetCurrentChat() {
+  currentSessionId = "";
+  currentMessages = [];
+  localStorage.removeItem("currentChatSessionId");
+  chatTitle.textContent = "新对话";
+  renderConversation();
+  renderSources([]);
+}
+
+async function loadChatSessions() {
+  const response = await fetch(`/api/chat-sessions?space=${encodeURIComponent(getCurrentSpace())}`);
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "历史对话读取失败");
+  }
+  renderChatSessions(payload.sessions || []);
+  return payload.sessions || [];
+}
+
+async function loadChatSession(sessionId) {
+  if (!sessionId) {
+    resetCurrentChat();
+    return;
+  }
+  const response = await fetch(
+    `/api/chat-session?space=${encodeURIComponent(getCurrentSpace())}&session=${encodeURIComponent(sessionId)}`
+  );
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "历史对话读取失败");
+  }
+
+  currentSessionId = payload.session.id;
+  currentMessages = payload.session.messages || [];
+  localStorage.setItem("currentChatSessionId", currentSessionId);
+  chatTitle.textContent = payload.session.title || "历史对话";
+  renderConversation();
+  const lastAssistant = [...currentMessages].reverse().find((message) => message.role === "assistant");
+  renderSources(lastAssistant?.citations || []);
+  await loadChatSessions();
+}
+
+async function initializeChatHistory() {
+  try {
+    const sessions = await loadChatSessions();
+    const remembered = sessions.find((session) => session.id === currentSessionId);
+    if (remembered) {
+      await loadChatSession(remembered.id);
+      return;
+    }
+    resetCurrentChat();
+    renderChatSessions(sessions);
+  } catch (error) {
+    chatSessionsBox.className = "chat-sessions empty error";
+    chatSessionsBox.textContent =
+      error instanceof Error ? error.message : "历史对话读取失败。";
+  }
+}
+
 async function resolveImportSpace() {
   if (kbSpaceAction.value === "existing") {
     const selectedSpace = kbTargetSpace.value || getCurrentSpace();
@@ -605,12 +728,16 @@ spaceSelect.addEventListener("change", async () => {
   kbTargetSpace.value = getCurrentSpace();
   setSpaceMessage(`已切换到：${getCurrentSpace()}`, "success");
   await loadKnowledgeStatus();
+  resetCurrentChat();
+  await initializeChatHistory();
 });
 kbTargetSpace.addEventListener("change", async () => {
   spaceSelect.value = kbTargetSpace.value;
   localStorage.setItem("currentKnowledgeSpace", kbTargetSpace.value);
   setSpaceMessage(`已切换到：${kbTargetSpace.value}`, "success");
   await loadKnowledgeStatus();
+  resetCurrentChat();
+  await initializeChatHistory();
 });
 kbSpaceAction.addEventListener("change", syncImportMode);
 createSpace.addEventListener("click", createKnowledgeSpace);
@@ -618,11 +745,26 @@ initVault.addEventListener("click", initializeVaultPath);
 refreshStatus.addEventListener("click", loadKnowledgeStatus);
 toggleImportPanel.addEventListener("click", () => openUtilityPanel(importPanel));
 toggleManagePanel.addEventListener("click", () => openUtilityPanel(managePanel));
+newChatButton.addEventListener("click", resetCurrentChat);
+chatSessionsBox.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-session-id]");
+  if (!button) {
+    return;
+  }
+  try {
+    await loadChatSession(button.dataset.sessionId);
+  } catch (error) {
+    chatSessionsBox.className = "chat-sessions empty error";
+    chatSessionsBox.textContent =
+      error instanceof Error ? error.message : "历史对话读取失败。";
+  }
+});
 kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));
 syncImportMode();
 loadSpaces()
   .then(loadKnowledgeStatus)
+  .then(initializeChatHistory)
   .catch((error) => {
     setSpaceMessage(
       error instanceof Error ? error.message : "项目库初始化失败。",
@@ -637,13 +779,26 @@ form.addEventListener("submit", async (event) => {
     return;
   }
 
+  currentMessages = [
+    ...currentMessages,
+    {
+      role: "user",
+      content: question,
+      createdAt: new Date().toISOString(),
+    },
+  ];
   setLoading();
+  questionInput.value = "";
 
   try {
     const response = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, space: getCurrentSpace() }),
+      body: JSON.stringify({
+        question,
+        space: getCurrentSpace(),
+        sessionId: currentSessionId,
+      }),
     });
     const payload = await response.json();
 
@@ -651,13 +806,33 @@ form.addEventListener("submit", async (event) => {
       throw new Error(payload.error || "请求失败");
     }
 
-    answerBox.className = "answer";
-    answerBox.textContent = payload.answer;
+    currentSessionId = payload.session?.id || currentSessionId;
+    if (currentSessionId) {
+      localStorage.setItem("currentChatSessionId", currentSessionId);
+    }
+    currentMessages = payload.session?.messages || [
+      ...currentMessages,
+      {
+        role: "assistant",
+        content: payload.answer,
+        citations: payload.citations,
+        createdAt: new Date().toISOString(),
+      },
+    ];
+    chatTitle.textContent = payload.session?.title || chatTitle.textContent || "当前对话";
+    renderConversation();
     renderSources(payload.citations);
+    await loadChatSessions();
   } catch (error) {
-    answerBox.className = "answer error";
-    answerBox.textContent =
-      error instanceof Error ? error.message : "请求失败，请稍后重试。";
+    currentMessages = [
+      ...currentMessages,
+      {
+        role: "assistant",
+        content: error instanceof Error ? error.message : "请求失败，请稍后重试。",
+        pending: false,
+      },
+    ];
+    renderConversation();
     sourcesBox.className = "sources empty";
     sourcesBox.textContent = "没有可展示的引用。";
   }

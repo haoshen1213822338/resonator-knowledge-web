@@ -773,6 +773,135 @@ button:disabled {
   padding: 18px;
 }
 
+.answer-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 360px;
+}
+
+.source-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.side-section + .side-section {
+  padding-top: 4px;
+  border-top: 1px solid rgba(211, 226, 217, 0.1);
+}
+
+.chat-header {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.chat-title {
+  margin: -8px 0 0;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 760;
+}
+
+.conversation {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 14px;
+  max-height: 520px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.chat-message {
+  display: grid;
+  gap: 6px;
+  width: min(88%, 720px);
+}
+
+.chat-message.user {
+  align-self: flex-end;
+}
+
+.chat-message.assistant {
+  align-self: flex-start;
+}
+
+.message-role {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.chat-message.user .message-role {
+  text-align: right;
+}
+
+.message-content {
+  border: 1px solid rgba(211, 226, 217, 0.11);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.035);
+  color: #edf4ef;
+  white-space: pre-wrap;
+  line-height: 1.72;
+}
+
+.chat-message.user .message-content {
+  border-color: rgba(117, 215, 179, 0.28);
+  background: rgba(117, 215, 179, 0.12);
+}
+
+.chat-message.pending .message-content {
+  color: var(--muted);
+}
+
+.chat-sessions {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.chat-session {
+  display: grid;
+  gap: 4px;
+  min-height: auto;
+  width: 100%;
+  border-color: rgba(211, 226, 217, 0.11);
+  padding: 10px 11px;
+  background: rgba(255, 255, 255, 0.028);
+  color: var(--text);
+  text-align: left;
+}
+
+.chat-session:hover,
+.chat-session.active {
+  border-color: rgba(117, 215, 179, 0.32);
+  background: rgba(117, 215, 179, 0.08);
+}
+
+.chat-session span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.chat-session small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 560;
+}
+
 .drawer-stack {
   display: grid;
   gap: 12px;
@@ -1045,6 +1174,14 @@ button:disabled {
   }
 
   button {
+    width: 100%;
+  }
+
+  .chat-header {
+    flex-direction: column;
+  }
+
+  .chat-message {
     width: 100%;
   }
 
