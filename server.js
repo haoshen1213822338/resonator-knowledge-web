@@ -753,11 +753,17 @@ function buildSnippet(content, tokens, question = "") {
     }
   }
 
-  return lines
+  const snippet = lines
     .slice(start, end)
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .slice(0, 1800);
+
+  if (snippet.trim().length < 220) {
+    return buildLeadSnippet(content);
+  }
+
+  return snippet;
 }
 
 function scoreDocument(content, fileName, tokens) {
