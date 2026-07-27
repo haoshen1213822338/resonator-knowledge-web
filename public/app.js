@@ -30,6 +30,10 @@ const rawFileCount = document.querySelector("#raw-file-count");
 const apiState = document.querySelector("#api-state");
 const kbPath = document.querySelector("#kb-path");
 const refreshStatus = document.querySelector("#refresh-status");
+const importPanel = document.querySelector("#import-panel");
+const managePanel = document.querySelector("#manage-panel");
+const toggleImportPanel = document.querySelector("#toggle-import-panel");
+const toggleManagePanel = document.querySelector("#toggle-manage-panel");
 
 const root = document.documentElement;
 const pointer = {
@@ -54,12 +58,19 @@ function renderSources(citations) {
 
   sourcesBox.className = "sources";
   sourcesBox.innerHTML = citations
+    .slice(0, 5)
     .map(
-      (item) => `
-        <div class="source-item">
-          <p class="source-title">${escapeHtml(item.file)}</p>
+      (item, index) => `
+        <div class="source-item source-compact">
+          <div class="source-heading">
+            <span class="source-index">${index + 1}</span>
+            <p class="source-title">${escapeHtml(item.file)}</p>
+          </div>
           <div class="source-meta">相关度：${item.score}</div>
-          <div class="source-snippet">${escapeHtml(item.snippet)}</div>
+          <details class="source-details">
+            <summary>查看引用片段</summary>
+            <div class="source-snippet">${escapeHtml(item.snippet)}</div>
+          </details>
         </div>
       `,
     )
@@ -398,6 +409,14 @@ function syncImportMode() {
   kbNewSpaceLabel.classList.toggle("hidden", !isCreate);
 }
 
+function openUtilityPanel(panel) {
+  if (!panel) {
+    return;
+  }
+  panel.open = true;
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
 async function resolveImportSpace() {
   if (kbSpaceAction.value === "existing") {
     const selectedSpace = kbTargetSpace.value || getCurrentSpace();
@@ -597,6 +616,8 @@ kbSpaceAction.addEventListener("change", syncImportMode);
 createSpace.addEventListener("click", createKnowledgeSpace);
 initVault.addEventListener("click", initializeVaultPath);
 refreshStatus.addEventListener("click", loadKnowledgeStatus);
+toggleImportPanel.addEventListener("click", () => openUtilityPanel(importPanel));
+toggleManagePanel.addEventListener("click", () => openUtilityPanel(managePanel));
 kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));
 syncImportMode();
