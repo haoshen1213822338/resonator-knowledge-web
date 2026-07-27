@@ -1774,7 +1774,12 @@ async function handleVaultConfig(request, response) {
 
 async function serveStatic(request, response) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
-  const safePath = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
+  const routeMap = {
+    "/": "/index.html",
+    "/admin": "/admin.html",
+    "/admin/": "/admin.html",
+  };
+  const safePath = routeMap[requestUrl.pathname] || requestUrl.pathname;
   const filePath = path.normalize(path.join(PUBLIC_DIR, safePath));
 
   if (!filePath.startsWith(PUBLIC_DIR)) {

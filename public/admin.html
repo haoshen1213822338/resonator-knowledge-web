@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>资料后台</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='12' fill='%239fd8c2'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <canvas class="resonance-canvas" id="resonance-canvas" aria-hidden="true"></canvas>
+
+    <main class="admin-shell">
+      <aside class="left-rail">
+        <header class="site-brand" aria-label="共振体 Resonator">
+          <div class="brand-wordmark">
+            <span class="brand-cn">共振体</span>
+            <span class="brand-divider"></span>
+            <span class="brand-en">RESONATOR</span>
+          </div>
+          <span class="brand-tag">COMMUNICATION</span>
+        </header>
+
+        <label class="rail-select">
+          <span>当前项目库</span>
+          <select id="space-select"></select>
+        </label>
+
+        <nav class="rail-actions" aria-label="后台操作">
+          <a class="primary-button link-button" href="/">返回问答页</a>
+          <button type="button" class="ghost-button" id="refresh-status">刷新状态</button>
+        </nav>
+      </aside>
+
+      <section class="admin-workspace" aria-labelledby="admin-title">
+        <header class="admin-head">
+          <div>
+            <p class="eyebrow">Knowledge Admin</p>
+            <h1 id="admin-title">资料后台</h1>
+          </div>
+          <p class="subtitle">上传资料、整理入库、管理项目库和本地知识库路径。</p>
+        </header>
+
+        <section class="admin-grid">
+          <article class="admin-card primary-admin-card" aria-labelledby="update-title">
+            <div class="section-label" id="update-title">资料入库</div>
+            <div class="update-grid">
+              <label>
+                <span>项目名称</span>
+                <input id="kb-project" value="梦星鸣潮" />
+              </label>
+              <label>
+                <span>入库方式</span>
+                <select id="kb-space-action">
+                  <option value="existing">加入已有资料库</option>
+                  <option value="create">新建资料库</option>
+                </select>
+              </label>
+              <label id="kb-existing-space-label">
+                <span>目标资料库</span>
+                <select id="kb-target-space"></select>
+              </label>
+              <label id="kb-new-space-label" class="hidden">
+                <span>新资料库名称</span>
+                <input id="kb-new-space-name" placeholder="例如：客户A项目库" />
+              </label>
+              <label class="wide-field">
+                <span>上传资料</span>
+                <input id="kb-file" type="file" accept=".md,.txt,.csv,.docx,.pdf,.xlsx,.pptx,.png,.jpg,.jpeg,.webp,.bmp" multiple />
+              </label>
+              <label>
+                <span>整理类型</span>
+                <select id="kb-mode">
+                  <option value="mixed">综合整理</option>
+                  <option value="faq">FAQ</option>
+                  <option value="sop">SOP</option>
+                  <option value="analysis">项目分析</option>
+                  <option value="project">项目资料</option>
+                </select>
+              </label>
+              <label>
+                <span>输出文件名</span>
+                <input id="kb-output-name" placeholder="不填则自动生成" />
+              </label>
+            </div>
+            <div class="update-actions">
+              <button type="button" class="ghost-button compact-button" id="kb-dry-run">
+                预检查
+              </button>
+              <button type="button" class="primary-button compact-button" id="kb-update">
+                上传并整理
+              </button>
+            </div>
+            <pre id="kb-status" class="update-status">选择文件后，可以先预检查，再上传并整理。</pre>
+          </article>
+
+          <article class="admin-card" aria-labelledby="space-title">
+            <div class="section-label" id="space-title">项目库管理</div>
+            <div class="space-control">
+              <label>
+                <span>新建项目库</span>
+                <input id="new-space-name" placeholder="例如：客户A项目库" />
+              </label>
+              <button type="button" class="primary-button compact-button" id="create-space">
+                新建并切换
+              </button>
+            </div>
+            <p id="space-message" class="space-message">项目库会同步创建到本地 Obsidian 仓库。</p>
+          </article>
+
+          <article class="admin-card vault-panel hidden" id="vault-panel" aria-labelledby="vault-title">
+            <div class="section-label" id="vault-title">本机知识库路径</div>
+            <div class="vault-control">
+              <label>
+                <span>Obsidian 总仓库路径</span>
+                <input id="vault-path" placeholder="例如：D:\公司知识库" />
+              </label>
+              <button type="button" class="primary-button compact-button" id="init-vault">
+                初始化并切换
+              </button>
+            </div>
+            <p id="vault-message" class="vault-message">仅部署电脑本机可见。初始化后，网页和 Obsidian 共用这个文件夹。</p>
+          </article>
+
+          <article class="admin-card" aria-labelledby="status-title">
+            <div class="section-label" id="status-title">知识库状态</div>
+            <div class="status-grid">
+              <div class="status-item">
+                <span>本地仓库</span>
+                <strong id="vault-state">检查中</strong>
+              </div>
+              <div class="status-item">
+                <span>AI 输出</span>
+                <strong id="ai-file-count">-</strong>
+              </div>
+              <div class="status-item">
+                <span>原始资料</span>
+                <strong id="raw-file-count">-</strong>
+              </div>
+              <div class="status-item">
+                <span>DeepSeek</span>
+                <strong id="api-state">检查中</strong>
+              </div>
+            </div>
+            <div class="status-footer">
+              <span id="kb-path">正在读取本地知识库路径。</span>
+            </div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

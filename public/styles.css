@@ -77,9 +77,20 @@ body::after {
   padding: 14px;
 }
 
+.admin-shell {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 272px minmax(0, 1fr);
+  gap: 14px;
+  min-height: 100dvh;
+  padding: 14px;
+}
+
 .left-rail,
 .right-rail,
-.chat-workspace {
+.chat-workspace,
+.admin-workspace {
   min-height: 0;
   border: 1px solid var(--line);
   border-radius: 18px;
@@ -113,6 +124,47 @@ body::after {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.038), rgba(255, 255, 255, 0.014)),
     rgba(12, 15, 15, 0.72);
+}
+
+.admin-workspace {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+  overflow: auto;
+  padding: 18px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.038), rgba(255, 255, 255, 0.014)),
+    rgba(12, 15, 15, 0.72);
+}
+
+.admin-head {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 2px 4px 4px;
+}
+
+.admin-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.admin-card {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.016)),
+    var(--panel);
+}
+
+.primary-admin-card {
+  grid-row: span 3;
 }
 
 .site-brand {
@@ -274,6 +326,18 @@ button {
     border-color 150ms ease;
 }
 
+a.link-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  border-radius: 12px;
+  padding: 0 14px;
+  color: inherit;
+  font-weight: 760;
+  text-decoration: none;
+}
+
 button:hover {
   transform: translateY(-1px);
 }
@@ -326,6 +390,10 @@ button:disabled {
 .rail-actions button {
   width: 100%;
   justify-content: center;
+}
+
+.rail-actions .link-button {
+  width: 100%;
 }
 
 .history-block {
@@ -617,6 +685,20 @@ button:disabled {
   padding: 14px;
 }
 
+.admin-card.update-panel,
+.admin-card.space-panel,
+.admin-card.vault-panel,
+.admin-card.status-panel {
+  border-top: 1px solid var(--line);
+}
+
+.admin-card > .update-grid,
+.admin-card > .space-control,
+.admin-card > .vault-control {
+  position: relative;
+  z-index: 1;
+}
+
 .update-grid,
 .space-control,
 .vault-control {
@@ -625,7 +707,11 @@ button:disabled {
 }
 
 .update-grid {
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.wide-field {
+  grid-column: 1 / -1;
 }
 
 .vault-control,
@@ -728,7 +814,8 @@ button:disabled {
     overflow: auto;
   }
 
-  .app-shell {
+  .app-shell,
+  .admin-shell {
     grid-template-columns: 260px minmax(0, 1fr);
     height: auto;
     min-height: 100dvh;
@@ -739,17 +826,27 @@ button:disabled {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+
+  .admin-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .primary-admin-card {
+    grid-row: auto;
+  }
 }
 
 @media (max-width: 820px) {
-  .app-shell {
+  .app-shell,
+  .admin-shell {
     grid-template-columns: 1fr;
     padding: 10px;
   }
 
   .left-rail,
   .right-rail,
-  .chat-workspace {
+  .chat-workspace,
+  .admin-workspace {
     border-radius: 16px;
   }
 
@@ -758,11 +855,17 @@ button:disabled {
   }
 
   .workspace-head,
+  .admin-head,
   .composer {
     grid-template-columns: 1fr;
   }
 
   .workspace-head {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .admin-head {
     align-items: start;
     flex-direction: column;
   }
@@ -774,6 +877,10 @@ button:disabled {
 
   .composer {
     display: grid;
+  }
+
+  .update-grid {
+    grid-template-columns: 1fr;
   }
 
   .composer-actions,

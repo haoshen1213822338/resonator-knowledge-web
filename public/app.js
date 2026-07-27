@@ -57,11 +57,16 @@ function setLoading() {
       pending: true,
     },
   ]);
-  sourcesBox.className = "sources empty";
-  sourcesBox.textContent = "正在查找引用来源。";
+  if (sourcesBox) {
+    sourcesBox.className = "sources empty";
+    sourcesBox.textContent = "正在查找引用来源。";
+  }
 }
 
 function renderConversation(messages = currentMessages) {
+  if (!conversationBox) {
+    return;
+  }
   if (!messages.length) {
     conversationBox.className = "conversation empty";
     conversationBox.textContent = "等待你的问题。";
@@ -85,6 +90,9 @@ function renderConversation(messages = currentMessages) {
 }
 
 function renderChatSessions(sessions = []) {
+  if (!chatSessionsBox) {
+    return;
+  }
   if (!sessions.length) {
     chatSessionsBox.className = "chat-sessions empty";
     chatSessionsBox.textContent = "暂无历史对话。";
@@ -114,6 +122,9 @@ function renderChatSessions(sessions = []) {
 }
 
 function renderSources(citations) {
+  if (!sourcesBox) {
+    return;
+  }
   if (!citations || citations.length === 0) {
     sourcesBox.className = "sources empty";
     sourcesBox.textContent = "没有找到相关知识文件。";
@@ -376,15 +387,21 @@ function formatLatestUpdate(value) {
 }
 
 function getCurrentSpace() {
-  return spaceSelect.value || localStorage.getItem("currentKnowledgeSpace") || "";
+  return spaceSelect?.value || localStorage.getItem("currentKnowledgeSpace") || "";
 }
 
 function setSpaceMessage(message, type = "") {
+  if (!spaceMessage) {
+    return;
+  }
   spaceMessage.className = type ? `space-message ${type}` : "space-message";
   spaceMessage.textContent = message;
 }
 
 function setVaultMessage(message, type = "") {
+  if (!vaultMessage) {
+    return;
+  }
   vaultMessage.className = type ? `vault-message ${type}` : "vault-message";
   vaultMessage.textContent = message;
 }
@@ -396,8 +413,12 @@ function renderSpaces(spaces, selectedSpace) {
       return `<option value="${space.id}" ${selected}>${space.name}</option>`;
     })
     .join("");
-  spaceSelect.innerHTML = options;
-  kbTargetSpace.innerHTML = options;
+  if (spaceSelect) {
+    spaceSelect.innerHTML = options;
+  }
+  if (kbTargetSpace) {
+    kbTargetSpace.innerHTML = options;
+  }
 }
 
 async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledgeSpace")) {
@@ -413,8 +434,12 @@ async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledg
     : payload.defaultSpace || spaces[0]?.id || "";
   renderSpaces(spaces, selected);
   if (selected) {
-    spaceSelect.value = selected;
-    kbTargetSpace.value = selected;
+    if (spaceSelect) {
+      spaceSelect.value = selected;
+    }
+    if (kbTargetSpace) {
+      kbTargetSpace.value = selected;
+    }
     localStorage.setItem("currentKnowledgeSpace", selected);
   }
 }
@@ -468,6 +493,9 @@ async function createSpaceByName(name) {
 }
 
 function syncImportMode() {
+  if (!kbSpaceAction || !kbExistingSpaceLabel || !kbNewSpaceLabel) {
+    return;
+  }
   const isCreate = kbSpaceAction.value === "create";
   kbExistingSpaceLabel.classList.toggle("hidden", isCreate);
   kbNewSpaceLabel.classList.toggle("hidden", !isCreate);
@@ -485,7 +513,9 @@ function resetCurrentChat() {
   currentSessionId = "";
   currentMessages = [];
   localStorage.removeItem("currentChatSessionId");
-  chatTitle.textContent = "新对话";
+  if (chatTitle) {
+    chatTitle.textContent = "新对话";
+  }
   renderConversation();
   renderSources([]);
 }
@@ -542,7 +572,7 @@ async function initializeChatHistory() {
 
 async function resolveImportSpace() {
   if (kbSpaceAction.value === "existing") {
-    const selectedSpace = kbTargetSpace.value || getCurrentSpace();
+    const selectedSpace = kbTargetSpace?.value || getCurrentSpace();
     if (!selectedSpace) {
       throw new Error("请先选择要加入的已有资料库。");
     }
@@ -555,8 +585,12 @@ async function resolveImportSpace() {
   }
   const createdSpace = await createSpaceByName(name);
   kbNewSpaceName.value = "";
-  kbTargetSpace.value = createdSpace;
-  spaceSelect.value = createdSpace;
+  if (kbTargetSpace) {
+    kbTargetSpace.value = createdSpace;
+  }
+  if (spaceSelect) {
+    spaceSelect.value = createdSpace;
+  }
   localStorage.setItem("currentKnowledgeSpace", createdSpace);
   setSpaceMessage(`已创建并切换到：${createdSpace}`, "success");
   return createdSpace;
@@ -600,24 +634,38 @@ async function initializeVaultPath() {
 }
 
 function renderKnowledgeStatus(status) {
-  vaultPanel.classList.toggle("hidden", !status.canConfigureVault);
-  if (status.canConfigureVault) {
+  vaultPanel?.classList.toggle("hidden", !status.canConfigureVault);
+  if (status.canConfigureVault && vaultPath) {
     vaultPath.value = status.vaultDir || "";
   }
-  vaultState.textContent = status.ok ? "已初始化" : "异常";
-  aiFileCount.textContent = `${status.counts?.aiFiles ?? 0} 个`;
-  rawFileCount.textContent = `${status.counts?.rawFiles ?? 0} 个`;
-  apiState.textContent = status.hasApiKey ? "已连接" : "未配置";
-  kbPath.textContent = [
-    `当前项目库：${status.spaceRoot}`,
-    `最近更新：${formatLatestUpdate(status.latestUpdate)}`,
-  ].join("  ·  ");
+  if (vaultState) {
+    vaultState.textContent = status.ok ? "已初始化" : "异常";
+  }
+  if (aiFileCount) {
+    aiFileCount.textContent = `${status.counts?.aiFiles ?? 0} 个`;
+  }
+  if (rawFileCount) {
+    rawFileCount.textContent = `${status.counts?.rawFiles ?? 0} 个`;
+  }
+  if (apiState) {
+    apiState.textContent = status.hasApiKey ? "已连接" : "未配置";
+  }
+  if (kbPath) {
+    kbPath.textContent = [
+      `当前项目库：${status.spaceRoot}`,
+      `最近更新：${formatLatestUpdate(status.latestUpdate)}`,
+    ].join("  ·  ");
+  }
 }
 
 async function loadKnowledgeStatus() {
   try {
-    vaultState.textContent = "检查中";
-    apiState.textContent = "检查中";
+    if (vaultState) {
+      vaultState.textContent = "检查中";
+    }
+    if (apiState) {
+      apiState.textContent = "检查中";
+    }
     const space = getCurrentSpace();
     const response = await fetch(`/api/kb-status?space=${encodeURIComponent(space)}`);
     const status = await response.json();
@@ -626,14 +674,23 @@ async function loadKnowledgeStatus() {
     }
     renderKnowledgeStatus(status);
   } catch (error) {
-    vaultState.textContent = "异常";
-    apiState.textContent = "待检查";
-    kbPath.textContent =
-      error instanceof Error ? error.message : "无法读取知识库状态。";
+    if (vaultState) {
+      vaultState.textContent = "异常";
+    }
+    if (apiState) {
+      apiState.textContent = "待检查";
+    }
+    if (kbPath) {
+      kbPath.textContent =
+        error instanceof Error ? error.message : "无法读取知识库状态。";
+    }
   }
 }
 
 function setUpdateLoading(message) {
+  if (!kbStatus || !kbDryRun || !kbUpdate) {
+    return;
+  }
   kbStatus.className = "update-status";
   kbStatus.textContent = message;
   kbDryRun.disabled = true;
@@ -641,8 +698,12 @@ function setUpdateLoading(message) {
 }
 
 function setUpdateIdle() {
-  kbDryRun.disabled = false;
-  kbUpdate.disabled = false;
+  if (kbDryRun) {
+    kbDryRun.disabled = false;
+  }
+  if (kbUpdate) {
+    kbUpdate.disabled = false;
+  }
 }
 
 async function runKnowledgeUpdate(dryRun) {
@@ -710,43 +771,51 @@ if (!canvas || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
   fallbackFrame();
 }
 
-sampleButton.addEventListener("click", () => {
+sampleButton?.addEventListener("click", () => {
   questionInput.value = "梦星鸣潮每日返图传哪里？";
   questionInput.focus();
 });
 
-questionInput.addEventListener("keydown", (event) => {
+questionInput?.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
     return;
   }
   event.preventDefault();
-  form.requestSubmit();
+  form?.requestSubmit();
 });
 
-spaceSelect.addEventListener("change", async () => {
+spaceSelect?.addEventListener("change", async () => {
   localStorage.setItem("currentKnowledgeSpace", getCurrentSpace());
-  kbTargetSpace.value = getCurrentSpace();
+  if (kbTargetSpace) {
+    kbTargetSpace.value = getCurrentSpace();
+  }
   setSpaceMessage(`已切换到：${getCurrentSpace()}`, "success");
   await loadKnowledgeStatus();
   resetCurrentChat();
-  await initializeChatHistory();
+  if (chatSessionsBox) {
+    await initializeChatHistory();
+  }
 });
-kbTargetSpace.addEventListener("change", async () => {
-  spaceSelect.value = kbTargetSpace.value;
+kbTargetSpace?.addEventListener("change", async () => {
+  if (spaceSelect) {
+    spaceSelect.value = kbTargetSpace.value;
+  }
   localStorage.setItem("currentKnowledgeSpace", kbTargetSpace.value);
   setSpaceMessage(`已切换到：${kbTargetSpace.value}`, "success");
   await loadKnowledgeStatus();
   resetCurrentChat();
-  await initializeChatHistory();
+  if (chatSessionsBox) {
+    await initializeChatHistory();
+  }
 });
-kbSpaceAction.addEventListener("change", syncImportMode);
-createSpace.addEventListener("click", createKnowledgeSpace);
-initVault.addEventListener("click", initializeVaultPath);
-refreshStatus.addEventListener("click", loadKnowledgeStatus);
-toggleImportPanel.addEventListener("click", () => openUtilityPanel(importPanel));
-toggleManagePanel.addEventListener("click", () => openUtilityPanel(managePanel));
-newChatButton.addEventListener("click", resetCurrentChat);
-chatSessionsBox.addEventListener("click", async (event) => {
+kbSpaceAction?.addEventListener("change", syncImportMode);
+createSpace?.addEventListener("click", createKnowledgeSpace);
+initVault?.addEventListener("click", initializeVaultPath);
+refreshStatus?.addEventListener("click", loadKnowledgeStatus);
+toggleImportPanel?.addEventListener("click", () => openUtilityPanel(importPanel));
+toggleManagePanel?.addEventListener("click", () => openUtilityPanel(managePanel));
+newChatButton?.addEventListener("click", resetCurrentChat);
+chatSessionsBox?.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-session-id]");
   if (!button) {
     return;
@@ -759,12 +828,17 @@ chatSessionsBox.addEventListener("click", async (event) => {
       error instanceof Error ? error.message : "历史对话读取失败。";
   }
 });
-kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
-kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));
+kbDryRun?.addEventListener("click", () => runKnowledgeUpdate(true));
+kbUpdate?.addEventListener("click", () => runKnowledgeUpdate(false));
 syncImportMode();
 loadSpaces()
   .then(loadKnowledgeStatus)
-  .then(initializeChatHistory)
+  .then(() => {
+    if (chatSessionsBox) {
+      return initializeChatHistory();
+    }
+    return null;
+  })
   .catch((error) => {
     setSpaceMessage(
       error instanceof Error ? error.message : "项目库初始化失败。",
@@ -772,7 +846,7 @@ loadSpaces()
     );
   });
 
-form.addEventListener("submit", async (event) => {
+form?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const question = questionInput.value.trim();
   if (!question) {
@@ -833,7 +907,9 @@ form.addEventListener("submit", async (event) => {
       },
     ];
     renderConversation();
-    sourcesBox.className = "sources empty";
-    sourcesBox.textContent = "没有可展示的引用。";
+    if (sourcesBox) {
+      sourcesBox.className = "sources empty";
+      sourcesBox.textContent = "没有可展示的引用。";
+    }
   }
 });
