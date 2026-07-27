@@ -60,6 +60,47 @@ const PROJECT_STOP_WORDS = new Set([
   "铁道",
 ]);
 
+const DEFAULT_PROJECT_ALIASES = [
+  {
+    canonical: "\u7f8e\u7684\u5c0f\u897f\u6885\u7535\u70ed\u6c34\u5668",
+    aliases: [
+      "\u5c0f\u897f\u6885",
+      "\u5c0f\u897f\u6885\u6848\u4f8b",
+      "\u7f8e\u7684\u5c0f\u897f\u6885",
+      "\u7535\u70ed\u6c34\u5668",
+      "\u65e0\u9541\u68d2",
+      "\u65e0\u9541\u68d2\u7cfb\u5217",
+    ],
+  },
+  {
+    canonical: "\u7f8e\u7684\u51b0\u7bb1",
+    aliases: [
+      "\u7f8e\u7684\u51b0\u7bb1",
+      "\u51b0\u7bb1\u4f1a\u8bae",
+      "\u7f8e\u7684\u51b0\u7bb1\u4f1a\u8bae\u8bb0\u5f55",
+      "\u5168\u98df\u6750\u4fdd\u9c9c",
+    ],
+  },
+  {
+    canonical: "\u68a6\u661f\u9e23\u6f6e",
+    aliases: [
+      "\u68a6\u661f",
+      "\u9e23\u6f6e",
+      "\u68a6\u661f\u9e23\u6f6e",
+      "\u6bcf\u65e5\u8fd4\u56fe",
+    ],
+  },
+  {
+    canonical: "\u5d29\u574f\uff1a\u661f\u7a79\u94c1\u9053",
+    aliases: [
+      "\u5d29\u94c1",
+      "\u661f\u94c1",
+      "\u661f\u7a79\u94c1\u9053",
+      "\u5d29\u574f\u661f\u7a79\u94c1\u9053",
+    ],
+  },
+];
+
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -640,6 +681,61 @@ function normalizeText(text) {
     .trim();
 }
 
+async function loadProjectAliases(paths) {
+  const aliasPath = path.join(paths.systemDir, "project_aliases.json");
+  try {
+    const content = await readFile(aliasPath, "utf8");
+    const parsed = JSON.parse(content);
+    return Array.isArray(parsed) ? [...DEFAULT_PROJECT_ALIASES, ...parsed] : DEFAULT_PROJECT_ALIASES;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return DEFAULT_PROJECT_ALIASES;
+    }
+    console.warn(`Failed to read project aliases: ${error.message}`);
+    return DEFAULT_PROJECT_ALIASES;
+  }
+}
+
+function expandQuestionWithAliases(question, aliasGroups = []) {
+  const normalizedQuestion = normalizeText(question);
+  const expanded = [question];
+
+  for (const group of aliasGroups) {
+    const canonical = String(group.canonical || "").trim();
+    const aliases = Array.isArray(group.aliases) ? group.aliases : [];
+    const terms = [canonical, ...aliases].filter(Boolean);
+    const hasMatch = terms.some((term) => normalizedQuestion.includes(normalizeText(term)));
+    if (hasMatch) {
+      expanded.push(canonical, ...aliases);
+    }
+  }
+
+  return Array.from(new Set(expanded)).join(" ");
+}
+
+function scoreAliasMatch(content, fileName, question, aliasGroups = []) {
+  const normalizedQuestion = normalizeText(question);
+  const normalizedTarget = normalizeText(`${fileName}\n${stripLowValueSections(content).slice(0, 4000)}`);
+  let score = 0;
+
+  for (const group of aliasGroups) {
+    const canonical = String(group.canonical || "").trim();
+    const aliases = Array.isArray(group.aliases) ? group.aliases : [];
+    const terms = [canonical, ...aliases].filter(Boolean);
+    const questionHit = terms.some((term) => normalizedQuestion.includes(normalizeText(term)));
+    if (!questionHit) {
+      continue;
+    }
+
+    const targetHits = terms.filter((term) => normalizedTarget.includes(normalizeText(term))).length;
+    if (targetHits > 0) {
+      score += 120 + targetHits * 24;
+    }
+  }
+
+  return score;
+}
+
 function tokenize(question) {
   let normalized = normalizeText(question);
   for (const stopWord of PROJECT_STOP_WORDS) {
@@ -707,6 +803,32 @@ function buildLeadSnippet(content) {
   return lines.slice(0, 34).join("\n").slice(0, 1800);
 }
 
+function classifyQuestionIntent(question) {
+  if (/时间|节点|排期|roadmap|日程|阶段|什么时候|几号|周期/.test(question)) {
+    return "timeline";
+  }
+  if (/最核心|核心是什么|核心内容|核心主张|关键是什么|重点|主线|策略|洞察/.test(question)) {
+    return "core";
+  }
+  if (/怎么做|如何做|流程|步骤|sop|处理|操作|上传|执行/.test(question)) {
+    return "process";
+  }
+  if (/风险|问题|隐患|注意|待确认|不确定|异常/.test(question)) {
+    return "risk";
+  }
+  if (/什么内容|哪些内容|主要内容|文件里|讲了什么|总结一下|概括|概览/.test(question)) {
+    return "overview";
+  }
+  return "general";
+}
+
+const INTENT_SECTION_PATTERNS = {
+  timeline: /时间|节点|排期|roadmap|日程|阶段|营销时间|关键节点/i,
+  core: /项目概述|核心主张|核心策略|营销洞察|创意营销策略|核心内容|核心定位|主线/i,
+  process: /sop|流程|步骤|执行|处理动作|操作|关键动作|核心营销动作/i,
+  risk: /风险|问题|隐患|注意|待确认|不确定|异常|资料缺口/i,
+};
+
 function isOverviewQuestion(question) {
   return /什么内容|哪些内容|主要内容|文件里|讲了什么|总结一下|概括|概览/.test(question);
 }
@@ -715,9 +837,44 @@ function isBroadIntentQuestion(question) {
   return /什么内容|哪些内容|主要内容|文件里|讲了什么|总结一下|概括|概览|最核心|核心是什么|核心内容|关键是什么/.test(question);
 }
 
-function buildSnippet(content, tokens, question = "") {
-  if (isOverviewQuestion(question) || isBroadIntentQuestion(question)) {
+function sliceSection(lines, start, maxLines = 34) {
+  let end = Math.min(lines.length, start + maxLines);
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^#{2}\s+/.test(lines[index])) {
+      end = Math.min(index, start + maxLines);
+      break;
+    }
+  }
+  return lines
+    .slice(start, end)
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .slice(0, 1800);
+}
+
+function buildIntentSnippet(content, intent) {
+  const pattern = INTENT_SECTION_PATTERNS[intent];
+  if (!pattern) {
+    return "";
+  }
+
+  const lines = stripLowValueSections(content).split(/\r?\n/);
+  const hitIndex = lines.findIndex((line) => /^#{1,4}\s+/.test(line) && pattern.test(line));
+  if (hitIndex === -1) {
+    return "";
+  }
+
+  return sliceSection(lines, hitIndex);
+}
+
+function buildSnippet(content, tokens, question = "", intent = "general") {
+  if (intent === "overview" || isOverviewQuestion(question) || isBroadIntentQuestion(question)) {
     return buildLeadSnippet(content);
+  }
+
+  const intentSnippet = buildIntentSnippet(content, intent);
+  if (intentSnippet.trim().length >= 220) {
+    return intentSnippet;
   }
 
   const searchableContent = stripLowValueSections(content);
@@ -770,7 +927,7 @@ function buildSnippet(content, tokens, question = "") {
   return snippet;
 }
 
-function scoreDocument(content, fileName, tokens) {
+function scoreDocument(content, fileName, tokens, question = "", aliasGroups = []) {
   const lowerContent = stripLowValueSections(content).toLowerCase();
   const lowerFileName = fileName.toLowerCase();
   let score = 0;
@@ -781,6 +938,7 @@ function scoreDocument(content, fileName, tokens) {
     score += contentCount * Math.min(token.length, 10);
     score += fileCount * Math.min(token.length, 10) * 4;
   }
+  score += scoreAliasMatch(content, fileName, question, aliasGroups);
   return score;
 }
 
@@ -789,24 +947,27 @@ async function listMarkdownFiles(directory) {
 }
 
 async function searchKnowledge(question, spaceId = DEFAULT_SPACE_ID) {
-  const tokens = tokenize(question);
+  const paths = await ensureKnowledgeBase(spaceId);
+  const aliasGroups = await loadProjectAliases(paths);
+  const expandedQuestion = expandQuestionWithAliases(question, aliasGroups);
+  const intent = classifyQuestionIntent(question);
+  const tokens = tokenize(expandedQuestion);
   if (tokens.length === 0) {
     return [];
   }
 
-  const paths = await ensureKnowledgeBase(spaceId);
   const files = await listMarkdownFiles(paths.knowledgeDir);
   const results = [];
   for (const filePath of files) {
     const content = await readFile(filePath, "utf8");
     const fileName = path.basename(filePath);
-    const score = scoreDocument(content, fileName, tokens);
+    const score = scoreDocument(content, fileName, tokens, question, aliasGroups);
     if (score > 0) {
       results.push({
         file: fileName,
         path: filePath,
         score,
-        snippet: buildSnippet(content, tokens, question),
+        snippet: buildSnippet(content, tokens, question, intent),
       });
     }
   }
