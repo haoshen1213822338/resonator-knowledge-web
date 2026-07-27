@@ -612,12 +612,131 @@ function getOutputFileName(project, outputName) {
   return `${safePathSegment(project)}_资料整理_${date}.md`;
 }
 
+const MODE_LABELS = {
+  project: "\u9879\u76ee\u8d44\u6599",
+  faq: "FAQ",
+  sop: "SOP",
+  analysis: "\u9879\u76ee\u5206\u6790",
+  mixed: "\u7efc\u5408\u6574\u7406",
+};
+
+const METADATA_FALLBACK = "\u5f85\u8865\u5145";
+
+function cleanMetadataValue(value) {
+  return String(value || "")
+    .replace(/^[\s\-*#|]+/, "")
+    .replace(/\*\*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractMetadataLine(content, labels) {
+  const labelPattern = labels.join("|");
+  const matcher = new RegExp(`(?:^|\\n)\\s*[-|]?\\s*(?:\\*\\*)?(?:${labelPattern})(?:\\*\\*)?\\s*[\uff1a:]\\s*([^\\n|]+)`);
+  const match = content.match(matcher);
+  return match ? cleanMetadataValue(match[1]) : "";
+}
+
+function extractCoreTheme(content) {
+  return extractMetadataLine(content, [
+    "\u6838\u5fc3\u4e3b\u5f20",
+    "\u6838\u5fc3\u9700\u6c42",
+    "\u6838\u5fc3\u7b56\u7565",
+    "\u6838\u5fc3\u4e3b\u9898",
+    "\u6838\u5fc3\u8d2d\u4e70\u7406\u7531",
+    "\u6838\u5fc3\u5b9a\u4f4d",
+  ]);
+}
+
+function extractTimeRange(content) {
+  const explicit = extractMetadataLine(content, [
+    "\u8425\u9500\u65f6\u95f4",
+    "\u65f6\u95f4\u8303\u56f4",
+    "\u9879\u76ee\u65f6\u95f4",
+    "\u5173\u952e\u8282\u70b9",
+    "\u65f6\u95f4",
+  ]);
+  if (explicit) {
+    return explicit;
+  }
+
+  const match = content.match(/(?:\d{4}\u5e74)?\d{1,2}\u6708\d{1,2}\u65e5\s*[-\u81f3\u5230\u2013\u2014]\s*(?:\d{4}\u5e74)?\d{1,2}\u6708\d{1,2}\u65e5/);
+  return match ? match[0] : "";
+}
+
+function getMatchedAliasGroup(project, content, aliasGroups) {
+  const target = normalizeText(`${project}\n${content.slice(0, 5000)}`);
+  return aliasGroups.find((group) => {
+    const terms = [group.canonical, ...(Array.isArray(group.aliases) ? group.aliases : [])]
+      .filter(Boolean)
+      .map((term) => normalizeText(term));
+    return terms.some((term) => term && target.includes(term));
+  });
+}
+
+function extractKeywords({ project, content, aliasGroup }) {
+  const keywords = new Set();
+  keywords.add(project);
+  if (aliasGroup?.canonical) {
+    keywords.add(aliasGroup.canonical);
+  }
+  for (const alias of aliasGroup?.aliases || []) {
+    keywords.add(alias);
+  }
+
+  const coreTheme = extractCoreTheme(content);
+  for (const term of coreTheme.split(/[\uff0c,\u3001\s=\u2192-]+/)) {
+    const cleaned = cleanMetadataValue(term);
+    if (cleaned.length >= 2 && cleaned.length <= 12) {
+      keywords.add(cleaned);
+    }
+  }
+
+  return Array.from(keywords).filter(Boolean).slice(0, 12);
+}
+
+function buildMetadataBlock({ project, mode, content, savedFiles, aliasGroups }) {
+  const aliasGroup = getMatchedAliasGroup(project, content, aliasGroups);
+  const aliases = aliasGroup?.aliases || [];
+  const customer = extractMetadataLine(content, [
+    "\u54c1\u724c/\u5ba2\u6237",
+    "\u5ba2\u6237",
+    "\u54c1\u724c",
+  ]) || METADATA_FALLBACK;
+  const coreTheme = extractCoreTheme(content) || METADATA_FALLBACK;
+  const timeRange = extractTimeRange(content) || METADATA_FALLBACK;
+  const keywords = extractKeywords({ project, content, aliasGroup });
+  const sourceFiles = savedFiles.map((filePath) => path.basename(filePath));
+
+  return [
+    "## \u8d44\u6599\u5143\u4fe1\u606f",
+    "",
+    `- \u9879\u76ee\u540d\uff1a${project}`,
+    `- \u522b\u540d\uff1a${aliases.length ? aliases.join("\u3001") : METADATA_FALLBACK}`,
+    `- \u5ba2\u6237\uff1a${customer}`,
+    `- \u8d44\u6599\u7c7b\u578b\uff1a${MODE_LABELS[mode] || mode || MODE_LABELS.mixed}`,
+    `- \u5173\u952e\u8bcd\uff1a${keywords.length ? keywords.join("\u3001") : METADATA_FALLBACK}`,
+    `- \u6838\u5fc3\u4e3b\u9898\uff1a${coreTheme}`,
+    `- \u65f6\u95f4\u8303\u56f4\uff1a${timeRange}`,
+    "- \u6765\u6e90\u6587\u4ef6\uff1a",
+    ...sourceFiles.map((fileName) => `  - ${fileName}`),
+    "",
+  ].join("\n");
+}
 async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedFiles, content }) {
   const paths = await ensureKnowledgeBase(spaceId);
 
   const outputFileName = getOutputFileName(project, outputName);
   const outputPath = path.join(paths.knowledgeDir, outputFileName);
   const createdAt = new Date().toISOString();
+  const aliasGroups = await loadProjectAliases(paths);
+  const metadataBlock = buildMetadataBlock({
+    project,
+    mode,
+    content,
+    savedFiles,
+    aliasGroups,
+  });
   const sourceList = savedFiles
     .map((filePath) => `- ${path.relative(paths.root, filePath)}`)
     .join("\n");
@@ -628,6 +747,8 @@ async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedF
     `created: ${createdAt}`,
     "source: web-upload",
     "---",
+    "",
+    metadataBlock,
     "",
     content.trim(),
     "",
