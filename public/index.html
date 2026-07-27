@@ -122,6 +122,21 @@
             <input id="kb-project" value="梦星鸣潮" />
           </label>
           <label>
+            <span>入库方式</span>
+            <select id="kb-space-action">
+              <option value="existing">加入已有资料库</option>
+              <option value="create">新建资料库</option>
+            </select>
+          </label>
+          <label id="kb-existing-space-label">
+            <span>目标资料库</span>
+            <select id="kb-target-space"></select>
+          </label>
+          <label id="kb-new-space-label" class="hidden">
+            <span>新资料库名称</span>
+            <input id="kb-new-space-name" placeholder="例如：客户A项目库" />
+          </label>
+          <label>
             <span>上传资料</span>
             <input id="kb-file" type="file" accept=".md,.txt,.csv,.docx,.pdf,.xlsx,.pptx" multiple />
           </label>

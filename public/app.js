@@ -11,6 +11,11 @@ const kbOutputName = document.querySelector("#kb-output-name");
 const kbDryRun = document.querySelector("#kb-dry-run");
 const kbUpdate = document.querySelector("#kb-update");
 const kbStatus = document.querySelector("#kb-status");
+const kbSpaceAction = document.querySelector("#kb-space-action");
+const kbTargetSpace = document.querySelector("#kb-target-space");
+const kbExistingSpaceLabel = document.querySelector("#kb-existing-space-label");
+const kbNewSpaceLabel = document.querySelector("#kb-new-space-label");
+const kbNewSpaceName = document.querySelector("#kb-new-space-name");
 const spaceSelect = document.querySelector("#space-select");
 const newSpaceName = document.querySelector("#new-space-name");
 const createSpace = document.querySelector("#create-space");
@@ -310,12 +315,14 @@ function setVaultMessage(message, type = "") {
 }
 
 function renderSpaces(spaces, selectedSpace) {
-  spaceSelect.innerHTML = spaces
+  const options = spaces
     .map((space) => {
       const selected = space.id === selectedSpace ? "selected" : "";
       return `<option value="${space.id}" ${selected}>${space.name}</option>`;
     })
     .join("");
+  spaceSelect.innerHTML = options;
+  kbTargetSpace.innerHTML = options;
 }
 
 async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledgeSpace")) {
@@ -332,6 +339,7 @@ async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledg
   renderSpaces(spaces, selected);
   if (selected) {
     spaceSelect.value = selected;
+    kbTargetSpace.value = selected;
     localStorage.setItem("currentKnowledgeSpace", selected);
   }
 }
@@ -368,6 +376,48 @@ async function createKnowledgeSpace() {
   } finally {
     createSpace.disabled = false;
   }
+}
+
+async function createSpaceByName(name) {
+  const response = await fetch("/api/spaces", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "资料库创建失败");
+  }
+  await loadSpaces(payload.space.id);
+  return payload.space.id;
+}
+
+function syncImportMode() {
+  const isCreate = kbSpaceAction.value === "create";
+  kbExistingSpaceLabel.classList.toggle("hidden", isCreate);
+  kbNewSpaceLabel.classList.toggle("hidden", !isCreate);
+}
+
+async function resolveImportSpace() {
+  if (kbSpaceAction.value === "existing") {
+    const selectedSpace = kbTargetSpace.value || getCurrentSpace();
+    if (!selectedSpace) {
+      throw new Error("请先选择要加入的已有资料库。");
+    }
+    return selectedSpace;
+  }
+
+  const name = kbNewSpaceName.value.trim();
+  if (!name) {
+    throw new Error("请输入新资料库名称。");
+  }
+  const createdSpace = await createSpaceByName(name);
+  kbNewSpaceName.value = "";
+  kbTargetSpace.value = createdSpace;
+  spaceSelect.value = createdSpace;
+  localStorage.setItem("currentKnowledgeSpace", createdSpace);
+  setSpaceMessage(`已创建并切换到：${createdSpace}`, "success");
+  return createdSpace;
 }
 
 async function initializeVaultPath() {
@@ -463,8 +513,9 @@ async function runKnowledgeUpdate(dryRun) {
   setUpdateLoading(dryRun ? "正在预检查上传资料..." : "正在上传并整理，可能需要几十秒...");
 
   try {
+    const targetSpace = await resolveImportSpace();
     const formData = new FormData();
-    formData.append("space", getCurrentSpace());
+    formData.append("space", targetSpace);
     formData.append("project", kbProject.value.trim());
     formData.append("mode", kbMode.value);
     formData.append("outputName", kbOutputName.value.trim());
@@ -532,14 +583,23 @@ questionInput.addEventListener("keydown", (event) => {
 
 spaceSelect.addEventListener("change", async () => {
   localStorage.setItem("currentKnowledgeSpace", getCurrentSpace());
+  kbTargetSpace.value = getCurrentSpace();
   setSpaceMessage(`已切换到：${getCurrentSpace()}`, "success");
   await loadKnowledgeStatus();
 });
+kbTargetSpace.addEventListener("change", async () => {
+  spaceSelect.value = kbTargetSpace.value;
+  localStorage.setItem("currentKnowledgeSpace", kbTargetSpace.value);
+  setSpaceMessage(`已切换到：${kbTargetSpace.value}`, "success");
+  await loadKnowledgeStatus();
+});
+kbSpaceAction.addEventListener("change", syncImportMode);
 createSpace.addEventListener("click", createKnowledgeSpace);
 initVault.addEventListener("click", initializeVaultPath);
 refreshStatus.addEventListener("click", loadKnowledgeStatus);
 kbDryRun.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate.addEventListener("click", () => runKnowledgeUpdate(false));
+syncImportMode();
 loadSpaces()
   .then(loadKnowledgeStatus)
   .catch((error) => {
