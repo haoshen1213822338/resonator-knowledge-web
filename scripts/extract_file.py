@@ -14,7 +14,20 @@ from pathlib import Path
 from typing import Any
 
 
-SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".xlsx", ".pptx", ".md", ".txt", ".csv"}
+SUPPORTED_EXTENSIONS = {
+    ".docx",
+    ".pdf",
+    ".xlsx",
+    ".pptx",
+    ".md",
+    ".txt",
+    ".csv",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -134,6 +147,37 @@ def extract_pptx(path: Path) -> str:
     return "\n\n".join(parts)
 
 
+def extract_image(path: Path) -> str:
+    """Extract visible text from an image by OCR."""
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as exc:
+        raise RuntimeError(
+            "当前 Python 环境未安装 OCR 依赖，请先安装 rapidocr-onnxruntime。"
+        ) from exc
+
+    engine = RapidOCR()
+    result, _ = engine(str(path))
+    if not result:
+        return ""
+
+    lines: list[str] = []
+    for item in result:
+        if len(item) < 2:
+            continue
+        text = str(item[1]).strip()
+        score = item[2] if len(item) > 2 else None
+        if not text:
+            continue
+        if isinstance(score, (int, float)):
+            lines.append(f"- {text}（置信度：{score:.2f}）")
+        else:
+            lines.append(f"- {text}")
+
+    return "\n".join(lines)
+
+
 def extract_file(path: Path) -> str:
     """Extract text from one supported file."""
 
@@ -151,6 +195,8 @@ def extract_file(path: Path) -> str:
         return extract_xlsx(path)
     if extension == ".pptx":
         return extract_pptx(path)
+    if extension in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+        return extract_image(path)
 
     raise ValueError(f"不支持的文件类型：{extension}")
 

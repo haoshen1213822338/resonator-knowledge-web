@@ -1,0 +1,6 @@
+python-docx
+pdfplumber
+pypdf
+openpyxl
+python-pptx
+rapidocr-onnxruntime

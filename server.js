@@ -44,6 +44,11 @@ const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   ".pdf",
   ".xlsx",
   ".pptx",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".bmp",
 ]);
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
