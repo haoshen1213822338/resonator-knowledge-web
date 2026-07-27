@@ -867,16 +867,7 @@ function buildIntentSnippet(content, intent) {
   return sliceSection(lines, hitIndex);
 }
 
-function buildSnippet(content, tokens, question = "", intent = "general") {
-  if (intent === "overview" || isOverviewQuestion(question) || isBroadIntentQuestion(question)) {
-    return buildLeadSnippet(content);
-  }
-
-  const intentSnippet = buildIntentSnippet(content, intent);
-  if (intentSnippet.trim().length >= 220) {
-    return intentSnippet;
-  }
-
+function buildKeywordSnippet(content, tokens) {
   const searchableContent = stripLowValueSections(content);
   const lines = searchableContent.split(/\r?\n/);
   let hitIndex = -1;
@@ -895,7 +886,7 @@ function buildSnippet(content, tokens, question = "", intent = "general") {
   }
 
   if (hitIndex === -1) {
-    return buildLeadSnippet(content);
+    return "";
   }
 
   let start = Math.max(0, hitIndex - 3);
@@ -906,25 +897,38 @@ function buildSnippet(content, tokens, question = "", intent = "general") {
     }
   }
 
-  let end = Math.min(lines.length, start + 34);
-  for (let index = hitIndex + 1; index < lines.length; index += 1) {
-    if (/^#{2}\s+/.test(lines[index])) {
-      end = Math.min(index, start + 34);
-      break;
+  return sliceSection(lines, start);
+}
+
+function mergeSnippets(snippets) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const snippet of snippets) {
+    const cleaned = String(snippet || "").trim();
+    if (!cleaned) {
+      continue;
     }
+    const key = normalizeText(cleaned.slice(0, 160));
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(cleaned);
   }
 
-  const snippet = lines
-    .slice(start, end)
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .slice(0, 1800);
+  return merged
+    .map((snippet, index) => `### 片段 ${index + 1}\n${snippet}`)
+    .join("\n\n")
+    .slice(0, 3600);
+}
 
-  if (snippet.trim().length < 220) {
-    return buildLeadSnippet(content);
-  }
+function buildSnippet(content, tokens, question = "", intent = "general") {
+  const leadSnippet = buildLeadSnippet(content);
+  const intentSnippet = buildIntentSnippet(content, intent);
+  const keywordSnippet = buildKeywordSnippet(content, tokens);
 
-  return snippet;
+  return mergeSnippets([leadSnippet, intentSnippet, keywordSnippet]) || leadSnippet;
 }
 
 function scoreDocument(content, fileName, tokens, question = "", aliasGroups = []) {
