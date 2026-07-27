@@ -8,102 +8,83 @@
   </head>
   <body>
     <canvas class="resonance-canvas" id="resonance-canvas" aria-hidden="true"></canvas>
-    <div class="page-grid" aria-hidden="true"></div>
 
-    <main class="shell">
-      <header class="topbar">
-        <div class="site-brand" aria-label="共振体 Resonator">
+    <main class="app-shell">
+      <aside class="left-rail">
+        <header class="site-brand" aria-label="共振体 Resonator">
           <div class="brand-wordmark">
             <span class="brand-cn">共振体</span>
             <span class="brand-divider"></span>
             <span class="brand-en">RESONATOR</span>
           </div>
           <span class="brand-tag">COMMUNICATION</span>
-        </div>
+        </header>
 
-        <div class="topbar-tools" aria-label="知识库工具栏">
-          <label class="topbar-select">
-            <span>当前项目库</span>
-            <select id="space-select"></select>
-          </label>
-          <button type="button" class="ghost-button compact-button" id="toggle-import-panel">
-            资料入库
-          </button>
-          <button type="button" class="ghost-button compact-button" id="toggle-manage-panel">
-            项目设置
-          </button>
-          <button type="button" class="ghost-button compact-button" id="refresh-status">
-            刷新
-          </button>
-        </div>
-      </header>
+        <label class="rail-select">
+          <span>项目库</span>
+          <select id="space-select"></select>
+        </label>
 
-      <section class="ask-panel" aria-labelledby="page-title">
-        <div class="resonance-stage" aria-hidden="true">
-          <div class="resonance-wave wave-back"></div>
-          <div class="resonance-wave wave-front"></div>
-          <div class="resonance-core">
-            <div class="core-orbit orbit-one"></div>
-            <div class="core-orbit orbit-two"></div>
-            <div class="core-orbit orbit-three"></div>
-            <div class="core-gem"></div>
-            <div class="core-flare"></div>
+        <nav class="rail-actions" aria-label="知识库操作">
+          <button type="button" class="primary-button" id="new-chat">新建对话</button>
+          <button type="button" class="ghost-button" id="toggle-import-panel">资料入库</button>
+          <button type="button" class="ghost-button" id="toggle-manage-panel">项目设置</button>
+          <button type="button" class="ghost-button" id="refresh-status">刷新状态</button>
+        </nav>
+
+        <section class="history-block" aria-labelledby="history-title">
+          <div class="section-label" id="history-title">历史对话</div>
+          <div id="chat-sessions" class="chat-sessions empty">暂无历史对话。</div>
+        </section>
+      </aside>
+
+      <section class="chat-workspace" aria-labelledby="page-title">
+        <div class="workspace-head">
+          <div>
+            <p class="eyebrow">AI 共振家</p>
+            <h1 id="page-title">公司知识问答</h1>
           </div>
-          <div class="energy-star"></div>
+          <p class="subtitle">用本地资料连续追问、检索和整理，回答保留来源。</p>
         </div>
-        <p class="eyebrow">AI 共振家</p>
-        <h1 id="page-title">公司知识问答</h1>
-        <p class="subtitle">愿力共生，把本地知识库转成可追溯的 AI 回答。</p>
 
-        <form id="ask-form" class="composer">
-          <textarea
-            id="question"
-            name="question"
-            rows="4"
-            placeholder="试试输入：梦星鸣潮每日返图传哪里？"
-            required
-          ></textarea>
-          <div class="composer-actions">
-            <button type="button" class="ghost-button" id="sample-button">
-              填入示例
-            </button>
-            <button type="submit" class="primary-button">提问</button>
-          </div>
-        </form>
-      </section>
-
-      <section class="answer-layout">
         <article class="answer-panel" aria-live="polite">
           <div class="chat-header">
             <div>
-              <div class="section-label">Agent 对话</div>
+              <div class="section-label">当前对话</div>
               <p id="chat-title" class="chat-title">新对话</p>
             </div>
-            <button type="button" class="ghost-button compact-button" id="new-chat">
-              新建对话
-            </button>
           </div>
           <div id="conversation" class="conversation empty">等待你的问题。</div>
           <div id="answer" class="answer hidden"></div>
         </article>
 
-        <aside class="source-panel">
-          <div class="side-section">
-            <div class="section-label">历史对话</div>
-            <div id="chat-sessions" class="chat-sessions empty">暂无历史对话。</div>
+        <form id="ask-form" class="composer">
+          <textarea
+            id="question"
+            name="question"
+            rows="3"
+            placeholder="输入问题，按 Enter 发送，Shift + Enter 换行"
+            required
+          ></textarea>
+          <div class="composer-actions">
+            <button type="button" class="ghost-button compact-button" id="sample-button">
+              示例
+            </button>
+            <button type="submit" class="primary-button compact-button">发送</button>
           </div>
-          <div class="side-section">
-            <div class="section-label">引用来源</div>
-            <div id="sources" class="sources empty">搜索到的知识文件会显示在这里。</div>
-          </div>
-        </aside>
+        </form>
       </section>
 
-      <section class="drawer-stack" aria-label="资料和项目管理">
+      <aside class="right-rail" aria-label="引用和资料操作">
+        <section class="source-panel">
+          <div class="section-label">引用来源</div>
+          <div id="sources" class="sources empty">回答后会显示来源文件。</div>
+        </section>
+
         <details class="drawer-panel" id="import-panel">
           <summary>
             <span>资料入库</span>
-            <small>上传文件后整理进当前知识库</small>
+            <small>上传后整理进当前项目库</small>
           </summary>
           <section class="update-panel" aria-labelledby="update-title">
             <div class="section-label" id="update-title">资料入库</div>
@@ -147,21 +128,21 @@
               </label>
             </div>
             <div class="update-actions">
-              <button type="button" class="ghost-button" id="kb-dry-run">
+              <button type="button" class="ghost-button compact-button" id="kb-dry-run">
                 预检查
               </button>
-              <button type="button" class="primary-button" id="kb-update">
+              <button type="button" class="primary-button compact-button" id="kb-update">
                 上传并整理
               </button>
             </div>
-            <pre id="kb-status" class="update-status">选择 md、txt、csv、Word、PDF、Excel 或 PPT 文件后，可以先预检查，再上传并整理。</pre>
+            <pre id="kb-status" class="update-status">选择文件后，可以先预检查，再上传并整理。</pre>
           </section>
         </details>
 
         <details class="drawer-panel" id="manage-panel">
           <summary>
-            <span>项目与本地库设置</span>
-            <small>新建项目库、查看路径和系统状态</small>
+            <span>项目设置</span>
+            <small>新建项目库和查看本地状态</small>
           </summary>
           <section class="space-panel" aria-labelledby="space-title">
             <div class="section-label" id="space-title">项目库管理</div>
@@ -216,7 +197,7 @@
             </div>
           </section>
         </details>
-      </section>
+      </aside>
     </main>
 
     <script src="/app.js" type="module"></script>
