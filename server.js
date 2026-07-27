@@ -32,6 +32,19 @@ const PYTHON_CMD = process.env.PYTHON_CMD || "python";
 const DEFAULT_UPDATE_INPUT =
   process.env.DEFAULT_UPDATE_INPUT ||
   "00_原始资料\\候选材料包\\流程测试_梦星鸣潮_每日返图";
+const FILE_EXTRACTOR_SCRIPT =
+  process.env.FILE_EXTRACTOR_SCRIPT || path.join(__dirname, "scripts", "extract_file.py");
+const PARSER_PYTHON_CMD =
+  process.env.PARSER_PYTHON_CMD || process.env.PYTHON_CMD || "python";
+const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
+  ".md",
+  ".txt",
+  ".csv",
+  ".docx",
+  ".pdf",
+  ".xlsx",
+  ".pptx",
+]);
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -240,9 +253,8 @@ async function getLatestWriteTime(files) {
 async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
   const paths = await ensureKnowledgeBase(spaceId);
 
-  const supportedFiles = new Set([".md", ".txt", ".csv"]);
-  const rawFiles = await listFilesRecursive(paths.rawDir, supportedFiles);
-  const uploadedFiles = await listFilesRecursive(paths.uploadRoot, supportedFiles);
+  const rawFiles = await listFilesRecursive(paths.rawDir, SUPPORTED_UPLOAD_EXTENSIONS);
+  const uploadedFiles = await listFilesRecursive(paths.uploadRoot, SUPPORTED_UPLOAD_EXTENSIONS);
   const aiFiles = await listFilesRecursive(paths.knowledgeDir, new Set([".md"]));
   const allFiles = [...rawFiles, ...aiFiles];
 
@@ -470,13 +482,74 @@ async function callOrganizationApi({ project, mode, documents }) {
   return text;
 }
 
+function runFileExtractor(filePath) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(PARSER_PYTHON_CMD, [FILE_EXTRACTOR_SCRIPT, filePath], {
+      cwd: __dirname,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+      },
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      reject(error);
+    });
+    child.on("close", (code) => {
+      let payload;
+      try {
+        payload = JSON.parse(stdout || "{}");
+      } catch {
+        reject(new Error(`文件解析器返回了无法读取的结果：${stderr || stdout}`));
+        return;
+      }
+
+      if (code !== 0 || !payload.ok) {
+        reject(new Error(payload.error || stderr || `文件解析失败：${filePath}`));
+        return;
+      }
+      resolve(payload);
+    });
+  });
+}
+
+function getExtractedFileName(filePath) {
+  const parsed = path.parse(filePath);
+  return `${parsed.name}_解析结果.md`;
+}
+
 async function loadUploadedDocuments(savedFiles, spaceRoot) {
   const documents = [];
   for (const filePath of savedFiles) {
+    const parsed = await runFileExtractor(filePath);
+    const extractedPath = path.join(path.dirname(filePath), getExtractedFileName(filePath));
+    const extractedContent = [
+      `# ${path.basename(filePath)} 解析结果`,
+      "",
+      `- 原文件：${path.relative(spaceRoot, filePath)}`,
+      `- 文件类型：${parsed.extension}`,
+      `- 提取字符数：${parsed.characters}`,
+      "",
+      "## 提取内容",
+      "",
+      parsed.content || "未提取到可读文字。",
+      "",
+    ].join("\n");
+    await writeFile(extractedPath, extractedContent, "utf8");
     documents.push({
       fileName: path.basename(filePath),
       relativePath: path.relative(spaceRoot, filePath),
-      content: await readFile(filePath, "utf8"),
+      extractedPath,
+      content: parsed.content || "",
     });
   }
   return documents;
@@ -956,8 +1029,8 @@ function safePathSegment(value) {
 
 function validateUploadFile(file) {
   const extension = path.extname(file.fileName).toLowerCase();
-  if (![".md", ".txt", ".csv"].includes(extension)) {
-    throw new Error("目前只支持上传 .md、.txt、.csv 文件。");
+  if (!SUPPORTED_UPLOAD_EXTENSIONS.has(extension)) {
+    throw new Error("目前支持上传 .md、.txt、.csv、.docx、.pdf、.xlsx、.pptx 文件。");
   }
   if (file.buffer.length === 0) {
     throw new Error(`文件内容为空：${file.fileName}`);
