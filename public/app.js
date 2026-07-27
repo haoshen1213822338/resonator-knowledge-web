@@ -146,11 +146,11 @@ function createResonanceField() {
     const lineWidth = 18 - layer * 3;
 
     const gradient = ctx.createLinearGradient(width * 0.16, 0, width * 0.84, 0);
-    gradient.addColorStop(0, `rgba(59, 87, 255, ${alpha * 0.4})`);
-    gradient.addColorStop(0.32, `rgba(130, 94, 255, ${alpha})`);
-    gradient.addColorStop(0.5, `rgba(255, 235, 255, ${alpha + 0.16})`);
-    gradient.addColorStop(0.64, `rgba(255, 213, 74, ${alpha * 0.5})`);
-    gradient.addColorStop(1, `rgba(59, 87, 255, ${alpha * 0.38})`);
+    gradient.addColorStop(0, `rgba(86, 126, 112, ${alpha * 0.36})`);
+    gradient.addColorStop(0.32, `rgba(104, 230, 186, ${alpha * 0.78})`);
+    gradient.addColorStop(0.5, `rgba(236, 248, 241, ${alpha + 0.08})`);
+    gradient.addColorStop(0.68, `rgba(104, 230, 186, ${alpha * 0.5})`);
+    gradient.addColorStop(1, `rgba(86, 126, 112, ${alpha * 0.34})`);
 
     ctx.beginPath();
     for (let step = 0; step <= 180; step += 1) {
@@ -180,7 +180,7 @@ function createResonanceField() {
     ctx.strokeStyle = gradient;
     ctx.lineWidth = Math.max(lineWidth, 2);
     ctx.lineCap = "round";
-    ctx.shadowColor = "rgba(139, 101, 255, 0.48)";
+    ctx.shadowColor = "rgba(104, 230, 186, 0.22)";
     ctx.shadowBlur = 28 + layer * 12;
     ctx.stroke();
     ctx.shadowBlur = 0;
@@ -192,9 +192,9 @@ function createResonanceField() {
     const pulse = 1 + Math.sin(time * 2.4) * 0.08;
 
     const glow = ctx.createRadialGradient(x, y, 0, x, y, 150 * pulse);
-    glow.addColorStop(0, "rgba(255, 230, 119, 0.42)");
-    glow.addColorStop(0.32, "rgba(154, 104, 255, 0.26)");
-    glow.addColorStop(1, "rgba(6, 7, 24, 0)");
+    glow.addColorStop(0, "rgba(236, 248, 241, 0.26)");
+    glow.addColorStop(0.32, "rgba(104, 230, 186, 0.18)");
+    glow.addColorStop(1, "rgba(5, 8, 7, 0)");
     ctx.fillStyle = glow;
     ctx.beginPath();
     ctx.arc(x, y, 150 * pulse, 0, Math.PI * 2);
@@ -207,8 +207,8 @@ function createResonanceField() {
       ctx.scale(1, 0.34 + ring * 0.08);
       ctx.strokeStyle =
         ring === 1
-          ? "rgba(255, 213, 74, 0.3)"
-          : "rgba(210, 190, 255, 0.22)";
+          ? "rgba(104, 230, 186, 0.3)"
+          : "rgba(220, 234, 226, 0.2)";
       ctx.lineWidth = 1.1;
       ctx.beginPath();
       ctx.ellipse(0, 0, 44 + ring * 11, 44 + ring * 11, 0, 0, Math.PI * 2);
@@ -216,7 +216,7 @@ function createResonanceField() {
       ctx.restore();
     }
 
-    ctx.fillStyle = "rgba(255, 231, 128, 0.9)";
+    ctx.fillStyle = "rgba(236, 248, 241, 0.86)";
     ctx.beginPath();
     ctx.arc(x, y, 8 * pulse, 0, Math.PI * 2);
     ctx.fill();
@@ -232,7 +232,7 @@ function createResonanceField() {
       const y = particle.y * height + driftY + parallaxY;
       const twinkle = 0.34 + Math.sin(time * 1.7 + particle.seed) * 0.22;
 
-      ctx.fillStyle = `rgba(230, 226, 255, ${twinkle})`;
+      ctx.fillStyle = `rgba(220, 234, 226, ${twinkle})`;
       ctx.beginPath();
       ctx.arc(x, y, particle.size, 0, Math.PI * 2);
       ctx.fill();
@@ -247,9 +247,9 @@ function createResonanceField() {
     ctx.globalCompositeOperation = "source-over";
 
     const base = ctx.createLinearGradient(0, 0, width, height);
-    base.addColorStop(0, "rgba(7, 8, 25, 0.72)");
-    base.addColorStop(0.5, "rgba(12, 7, 45, 0.4)");
-    base.addColorStop(1, "rgba(3, 4, 14, 0.82)");
+    base.addColorStop(0, "rgba(5, 8, 7, 0.72)");
+    base.addColorStop(0.5, "rgba(9, 18, 15, 0.42)");
+    base.addColorStop(1, "rgba(3, 5, 4, 0.84)");
     ctx.fillStyle = base;
     ctx.fillRect(0, 0, width, height);
 
