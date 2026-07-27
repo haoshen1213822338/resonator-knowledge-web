@@ -660,8 +660,59 @@ function tokenize(question) {
   return businessTokens.length > 0 ? businessTokens : uniqueTokens;
 }
 
-function buildSnippet(content, tokens) {
+function stripLowValueSections(content) {
   const lines = content.split(/\r?\n/);
+  const usefulLines = [];
+  let skippingYaml = lines[0]?.trim() === "---";
+  let skippingSection = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (skippingYaml) {
+      if (index > 0 && trimmed === "---") {
+        skippingYaml = false;
+      }
+      continue;
+    }
+
+    if (/^##\s*(来源文件|系统入库信息)\s*$/.test(trimmed)) {
+      skippingSection = true;
+      continue;
+    }
+
+    if (skippingSection && /^##\s+/.test(trimmed)) {
+      skippingSection = false;
+    }
+
+    if (!skippingSection) {
+      usefulLines.push(line);
+    }
+  }
+
+  return usefulLines.join("\n").trim();
+}
+
+function buildLeadSnippet(content) {
+  const lines = stripLowValueSections(content)
+    .split(/\r?\n/)
+    .filter((line) => line.trim());
+
+  return lines.slice(0, 34).join("\n").slice(0, 1800);
+}
+
+function isOverviewQuestion(question) {
+  return /什么内容|哪些内容|主要内容|文件里|讲了什么|总结一下|概括|概览/.test(question);
+}
+
+function buildSnippet(content, tokens, question = "") {
+  if (isOverviewQuestion(question)) {
+    return buildLeadSnippet(content);
+  }
+
+  const searchableContent = stripLowValueSections(content);
+  const lines = searchableContent.split(/\r?\n/);
   let hitIndex = -1;
   let bestScore = 0;
 
@@ -678,7 +729,7 @@ function buildSnippet(content, tokens) {
   }
 
   if (hitIndex === -1) {
-    return lines.slice(0, 10).join("\n").slice(0, 1800);
+    return buildLeadSnippet(content);
   }
 
   let start = Math.max(0, hitIndex - 3);
@@ -705,7 +756,7 @@ function buildSnippet(content, tokens) {
 }
 
 function scoreDocument(content, fileName, tokens) {
-  const lowerContent = content.toLowerCase();
+  const lowerContent = stripLowValueSections(content).toLowerCase();
   const lowerFileName = fileName.toLowerCase();
   let score = 0;
   for (const token of tokens) {
@@ -740,7 +791,7 @@ async function searchKnowledge(question, spaceId = DEFAULT_SPACE_ID) {
         file: fileName,
         path: filePath,
         score,
-        snippet: buildSnippet(content, tokens),
+        snippet: buildSnippet(content, tokens, question),
       });
     }
   }
