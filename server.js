@@ -711,8 +711,12 @@ function isOverviewQuestion(question) {
   return /什么内容|哪些内容|主要内容|文件里|讲了什么|总结一下|概括|概览/.test(question);
 }
 
+function isBroadIntentQuestion(question) {
+  return /什么内容|哪些内容|主要内容|文件里|讲了什么|总结一下|概括|概览|最核心|核心是什么|核心内容|关键是什么/.test(question);
+}
+
 function buildSnippet(content, tokens, question = "") {
-  if (isOverviewQuestion(question)) {
+  if (isOverviewQuestion(question) || isBroadIntentQuestion(question)) {
     return buildLeadSnippet(content);
   }
 
