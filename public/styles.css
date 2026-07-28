@@ -766,6 +766,45 @@ button:disabled {
   line-height: 1.56;
 }
 
+.upload-progress {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.upload-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 9px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.upload-progress-header strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.upload-progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.upload-progress-bar {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8cc8ff, #f2d17a);
+  box-shadow: 0 0 18px rgba(140, 200, 255, 0.35);
+  transition: width 240ms ease;
+}
+
 .vault-message,
 .space-message {
   margin: 10px 0 0;

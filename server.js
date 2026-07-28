@@ -461,6 +461,7 @@ async function callChatCompletionsApi(question, results, instructions, knowledge
         },
       ],
       stream: false,
+      temperature: 0.35,
     }),
   });
 
@@ -481,11 +482,12 @@ async function callAI(question, results, history = []) {
   const knowledgeContext = buildKnowledgeContext(results);
   const instructions = [
     "你是公司的知识库问答助手。",
-    "只能根据提供的本地知识库片段回答。",
-    "如果资料不足，直接说资料不足，不要编造。",
-    "回答要简洁、可执行，适合客服、管理员或接单人员直接使用。",
+    "回答必须优先基于提供的本地知识库片段，但可以在事实基础上做合理推断、归纳和下一步建议。",
+    "请把事实、推断、建议区分清楚：资料明确支持的内容用确定语气；推断内容要标注“推断”；没有证据的内容要标注“待确认”。",
+    "不要因为资料没有逐字写明就直接回答资料不足；先尝试从项目背景、时间线、需求、风险、流程和相似片段中总结可用判断。",
+    "只有完全没有相关片段时，才说明资料不足，并给出建议补充哪些资料。",
+    "回答要简洁、可执行，适合客服、管理员、项目负责人或接单人员直接使用。",
     "你可以结合上一轮对话理解追问、省略指代和连续任务。",
-    "但事实依据仍然必须来自本地知识库片段；如果片段不足，要说明资料不足。",
     "不要输出手机号、订单号、账号、密码、验证码等敏感信息。",
     "最后用“参考：文件名”列出用到的知识文件。",
   ].join("\n");
@@ -1644,6 +1646,29 @@ function validateUploadFile(file) {
   }
 }
 
+async function inspectUploadedFiles(spaceId, project, files) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const previewFolderName = `${safePathSegment(project)}_正式上传时自动生成时间目录`;
+  const previewUploadDir = path.join(paths.uploadRoot, previewFolderName);
+
+  const inspectedFiles = files.map((file) => {
+    validateUploadFile(file);
+    const fileName = getSafeUploadFileName(file.fileName);
+    return {
+      fileName,
+      extension: path.extname(fileName).toLowerCase(),
+      size: file.buffer.length,
+      previewPath: path.join(previewUploadDir, fileName),
+    };
+  });
+
+  return {
+    previewUploadDir,
+    inspectedFiles,
+    spaceRoot: paths.root,
+  };
+}
+
 async function saveUploadedFiles(spaceId, project, files) {
   const paths = await ensureKnowledgeBase(spaceId);
   const timestamp = new Date()
@@ -1691,34 +1716,33 @@ async function handleImportKnowledge(request, response) {
       return;
     }
 
-    const saved = await saveUploadedFiles(space, project, files);
     let result;
     if (dryRun) {
-      const fileStats = await Promise.all(
-        saved.savedFiles.map(async (filePath) => {
-          const info = await stat(filePath);
-          return {
-            filePath,
-            size: info.size,
-            extension: path.extname(filePath).toLowerCase(),
-          };
-        })
+      const inspection = await inspectUploadedFiles(space, project, files);
+      const totalBytes = inspection.inspectedFiles.reduce((total, item) => total + item.size, 0);
+      const hasVideo = inspection.inspectedFiles.some((item) =>
+        VIDEO_UPLOAD_EXTENSIONS.has(item.extension)
       );
-      const totalBytes = fileStats.reduce((total, item) => total + item.size, 0);
-      const hasVideo = fileStats.some((item) => VIDEO_UPLOAD_EXTENSIONS.has(item.extension));
       result = {
         stdout: [
-          "Dry run: 不调用 API，不解析正文，不写入 90_AI输出。",
+          "预检查完成：不会保存文件，不会解析正文，不会调用 AI，不会写入 90_AI输出。",
           `项目：${project}`,
           `模式：${mode}`,
-          `输入文件数：${fileStats.length}`,
+          `输入文件数：${inspection.inspectedFiles.length}`,
           `文件总大小：${(totalBytes / 1024 / 1024).toFixed(1)} MB`,
+          `正式上传时将保存到：${inspection.previewUploadDir}`,
           hasVideo ? "提示：视频会在正式上传整理时抽取音频、转文字和关键帧 OCR，耗时会明显更久。" : "",
-          ...fileStats.map((item) => `- ${path.relative(saved.spaceRoot, item.filePath)}`),
+          ...inspection.inspectedFiles.map(
+            (item) =>
+              `- ${item.fileName} / ${(item.size / 1024 / 1024).toFixed(1)} MB / ${item.extension}`
+          ),
         ].join("\n"),
         stderr: "",
+        uploadDir: inspection.previewUploadDir,
+        savedFiles: [],
       };
     } else {
+      const saved = await saveUploadedFiles(space, project, files);
       const documents = await loadUploadedDocuments(saved.savedFiles, saved.spaceRoot);
       const organizedContent = await callOrganizationApi({ project, mode, documents });
       const written = await writeKnowledgeOutput({
@@ -1738,6 +1762,8 @@ async function handleImportKnowledge(request, response) {
         stderr: "",
         outputPath: written.outputPath,
         logPath: written.logPath,
+        uploadDir: saved.uploadDir,
+        savedFiles: saved.savedFiles,
       };
     }
 
@@ -1745,8 +1771,8 @@ async function handleImportKnowledge(request, response) {
       ok: true,
       dryRun,
       space,
-      uploadDir: saved.uploadDir,
-      savedFiles: saved.savedFiles,
+      uploadDir: result.uploadDir,
+      savedFiles: result.savedFiles || [],
       stdout: result.stdout.trim(),
       stderr: result.stderr.trim(),
       outputPath: result.outputPath,

@@ -91,6 +91,15 @@
                 上传并整理
               </button>
             </div>
+            <div class="upload-progress hidden" id="kb-progress" aria-live="polite">
+              <div class="upload-progress-header">
+                <span id="kb-progress-label">等待开始</span>
+                <strong id="kb-progress-percent">0%</strong>
+              </div>
+              <div class="upload-progress-track">
+                <div class="upload-progress-bar" id="kb-progress-bar"></div>
+              </div>
+            </div>
             <pre id="kb-status" class="update-status">选择文件后，可以先预检查，再上传并整理。</pre>
           </article>
 

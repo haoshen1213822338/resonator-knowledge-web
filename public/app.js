@@ -15,6 +15,10 @@ const kbOutputName = document.querySelector("#kb-output-name");
 const kbDryRun = document.querySelector("#kb-dry-run");
 const kbUpdate = document.querySelector("#kb-update");
 const kbStatus = document.querySelector("#kb-status");
+const kbProgress = document.querySelector("#kb-progress");
+const kbProgressLabel = document.querySelector("#kb-progress-label");
+const kbProgressPercent = document.querySelector("#kb-progress-percent");
+const kbProgressBar = document.querySelector("#kb-progress-bar");
 const kbSpaceAction = document.querySelector("#kb-space-action");
 const kbTargetSpace = document.querySelector("#kb-target-space");
 const kbExistingSpaceLabel = document.querySelector("#kb-existing-space-label");
@@ -697,6 +701,68 @@ function setUpdateLoading(message) {
   kbUpdate.disabled = true;
 }
 
+function setUploadProgress(percent, label) {
+  if (!kbProgress || !kbProgressBar || !kbProgressPercent || !kbProgressLabel) {
+    return;
+  }
+  const safePercent = Math.max(0, Math.min(100, Math.round(percent)));
+  kbProgress.classList.remove("hidden");
+  kbProgressBar.style.width = `${safePercent}%`;
+  kbProgressPercent.textContent = `${safePercent}%`;
+  kbProgressLabel.textContent = label;
+}
+
+function resetUploadProgress() {
+  if (!kbProgress || !kbProgressBar) {
+    return;
+  }
+  kbProgress.classList.add("hidden");
+  kbProgressBar.style.width = "0%";
+}
+
+function sendImportRequest(formData, { dryRun, hasVideo }) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/import-kb");
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) {
+        return;
+      }
+      const uploadPercent = (event.loaded / event.total) * 100;
+      if (dryRun) {
+        setUploadProgress(uploadPercent, "正在检查文件信息");
+      } else {
+        setUploadProgress(Math.min(55, uploadPercent * 0.55), "正在上传原始文件");
+      }
+    };
+    request.upload.onload = () => {
+      if (dryRun) {
+        setUploadProgress(90, "正在生成预检查结果");
+      } else {
+        setUploadProgress(hasVideo ? 68 : 72, hasVideo ? "正在解析视频内容" : "正在解析文件内容");
+      }
+    };
+    request.onload = () => {
+      let payload = {};
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch {
+        reject(new Error("后端返回了无法读取的结果。"));
+        return;
+      }
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(payload.detail || payload.error || "更新失败"));
+        return;
+      }
+      setUploadProgress(100, dryRun ? "预检查完成" : "已写入知识库");
+      resolve(payload);
+    };
+    request.onerror = () => reject(new Error("网络连接中断，上传没有完成。"));
+    request.onabort = () => reject(new Error("上传已取消。"));
+    request.send(formData);
+  });
+}
+
 function setUpdateIdle() {
   if (kbDryRun) {
     kbDryRun.disabled = false;
@@ -724,6 +790,7 @@ async function runKnowledgeUpdate(dryRun) {
         ? "文件已开始上传。视频入库需要抽音频、转文字和关键帧识别，1GB 以上可能需要数分钟到十几分钟..."
         : "正在上传并整理，可能需要几十秒..."
   );
+  setUploadProgress(2, dryRun ? "准备预检查" : "准备上传");
 
   try {
     const targetSpace = await resolveImportSpace();
@@ -737,15 +804,7 @@ async function runKnowledgeUpdate(dryRun) {
       formData.append("files", file);
     }
 
-    const response = await fetch("/api/import-kb", {
-      method: "POST",
-      body: formData,
-    });
-    const payload = await response.json();
-
-    if (!response.ok) {
-      throw new Error(payload.detail || payload.error || "更新失败");
-    }
+    const payload = await sendImportRequest(formData, { dryRun, hasVideo });
 
     kbStatus.className = "update-status success";
     const saved = payload.savedFiles?.length
@@ -757,6 +816,7 @@ async function runKnowledgeUpdate(dryRun) {
     kbStatus.className = "update-status error";
     kbStatus.textContent =
       error instanceof Error ? error.message : "更新失败，请检查资料路径。";
+    setUploadProgress(100, "处理失败");
   } finally {
     setUpdateIdle();
   }
