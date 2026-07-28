@@ -1517,7 +1517,7 @@ function parseContentDisposition(value) {
       result[key] = decodeURIComponent(encoded);
       continue;
     }
-    result[rawKey] = Buffer.from(rawParameter, "latin1").toString("utf8");
+    result[rawKey] = rawParameter;
   }
   return result;
 }
@@ -1617,11 +1617,20 @@ function parseMultipartForm(request, bodyBuffer) {
 
 function safePathSegment(value) {
   return String(value || "")
-    .replace(/[<>:"/\\|?*\r\n]+/g, "_")
+    .replace(/[\u0000-\u001f\u007f\u0080-\u009f\uFFFD<>:"/\\|?*]+/g, "_")
     .replace(/\s+/g, "_")
     .replace(/_+/g, "_")
     .replace(/^\.+|\.+$/g, "")
     .slice(0, 80) || "未命名";
+}
+
+function getSafeUploadFileName(fileName) {
+  const rawName = String(fileName || "未命名").split(/[\\/]/).pop() || "未命名";
+  const extension = path.extname(rawName).toLowerCase();
+  const stem = rawName.slice(0, Math.max(0, rawName.length - extension.length));
+  const safeStem = safePathSegment(stem);
+  const safeExtension = SUPPORTED_UPLOAD_EXTENSIONS.has(extension) ? extension : "";
+  return `${safeStem}${safeExtension}`;
 }
 
 function validateUploadFile(file) {
@@ -1648,7 +1657,7 @@ async function saveUploadedFiles(spaceId, project, files) {
   const savedFiles = [];
   for (const file of files) {
     validateUploadFile(file);
-    const fileName = safePathSegment(path.basename(file.fileName));
+    const fileName = getSafeUploadFileName(file.fileName);
     const targetPath = path.join(uploadDir, fileName);
     await writeFile(targetPath, file.buffer);
     savedFiles.push(targetPath);

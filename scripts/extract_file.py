@@ -204,14 +204,18 @@ def require_ffmpeg() -> str:
 def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a command and return text output for diagnostics."""
 
-    return subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        return subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(f"视频处理命令执行失败：{detail[-2000:]}") from exc
 
 
 def transcribe_audio(audio_path: Path) -> str:
