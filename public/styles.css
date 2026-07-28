@@ -945,6 +945,32 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.file-manager-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.file-manager-head .section-label {
+  margin-bottom: 4px;
+}
+
+.file-manager-summary {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.file-manager-card.is-collapsed #file-manager-content {
+  display: none;
+}
+
+.file-manager-card.is-collapsed .file-manager-summary {
+  margin-bottom: 0;
+}
+
 .file-manager-tools {
   display: grid;
   grid-template-columns: minmax(150px, 0.7fr) minmax(220px, 1.4fr) auto;
@@ -1159,6 +1185,10 @@ button:disabled {
   .file-manager-tools,
   .file-row-main {
     grid-template-columns: 1fr;
+  }
+
+  .file-manager-head {
+    flex-direction: column;
   }
 
   .composer-actions,

@@ -24,6 +24,9 @@ const fileFilterType = document.querySelector("#file-filter-type");
 const fileSearch = document.querySelector("#file-search");
 const refreshFiles = document.querySelector("#refresh-files");
 const fileList = document.querySelector("#file-list");
+const fileManagerCard = document.querySelector("#file-manager-card");
+const toggleFileManager = document.querySelector("#toggle-file-manager");
+const fileManagerSummary = document.querySelector("#file-manager-summary");
 const kbSpaceAction = document.querySelector("#kb-space-action");
 const kbTargetSpace = document.querySelector("#kb-target-space");
 const kbExistingSpaceLabel = document.querySelector("#kb-existing-space-label");
@@ -52,6 +55,7 @@ const root = document.documentElement;
 let currentSessionId = localStorage.getItem("currentChatSessionId") || "";
 let currentMessages = [];
 const activeImportPolls = new Map();
+let managedFileCount = 0;
 const pointer = {
   x: window.innerWidth / 2,
   y: window.innerHeight * 0.35,
@@ -859,6 +863,8 @@ function renderManagedFiles(files = []) {
   if (!fileList) {
     return;
   }
+  managedFileCount = files.length;
+  updateFileManagerSummary();
   if (!files.length) {
     fileList.className = "file-list empty";
     fileList.textContent = "没有找到符合条件的资料。";
@@ -912,6 +918,32 @@ async function loadManagedFiles() {
   }
   renderManagedFiles(payload.files || []);
   return payload.files || [];
+}
+
+function isFileManagerCollapsed() {
+  return localStorage.getItem("fileManagerCollapsed") === "true";
+}
+
+function updateFileManagerSummary() {
+  if (!fileManagerSummary) {
+    return;
+  }
+  const typeLabel = fileFilterType?.selectedOptions?.[0]?.textContent || "当前筛选";
+  const query = fileSearch?.value?.trim();
+  fileManagerSummary.textContent = query
+    ? `${typeLabel} · 搜索“${query}” · ${managedFileCount} 个结果`
+    : `${typeLabel} · ${managedFileCount} 个文件`;
+}
+
+function applyFileManagerCollapsed(collapsed) {
+  if (!fileManagerCard || !toggleFileManager) {
+    return;
+  }
+  fileManagerCard.classList.toggle("is-collapsed", collapsed);
+  toggleFileManager.textContent = collapsed ? "展开列表" : "收起列表";
+  toggleFileManager.setAttribute("aria-expanded", String(!collapsed));
+  localStorage.setItem("fileManagerCollapsed", String(collapsed));
+  updateFileManagerSummary();
 }
 
 async function deleteManagedFile(relativePath) {
@@ -1232,6 +1264,9 @@ refreshStatus?.addEventListener("click", async () => {
   await loadManagedFiles();
 });
 refreshFiles?.addEventListener("click", loadManagedFiles);
+toggleFileManager?.addEventListener("click", () => {
+  applyFileManagerCollapsed(!isFileManagerCollapsed());
+});
 fileFilterType?.addEventListener("change", loadManagedFiles);
 fileSearch?.addEventListener("input", () => {
   window.clearTimeout(fileSearch._timer);
@@ -1277,6 +1312,7 @@ chatSessionsBox?.addEventListener("click", async (event) => {
 kbDryRun?.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate?.addEventListener("click", () => runKnowledgeUpdate(false));
 syncImportMode();
+applyFileManagerCollapsed(isFileManagerCollapsed());
 loadSpaces()
   .then(loadKnowledgeStatus)
   .then(loadImportJobs)
