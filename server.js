@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -311,6 +311,108 @@ async function getLatestWriteTime(files) {
     }
   }
   return latest ? latest.toISOString() : null;
+}
+
+function getManagedFileType(filePath, paths) {
+  const normalized = path.resolve(filePath);
+  if (normalized.startsWith(path.resolve(paths.knowledgeDir) + path.sep)) {
+    return "ai";
+  }
+  if (normalized.startsWith(path.resolve(paths.uploadRoot) + path.sep)) {
+    return "upload";
+  }
+  if (normalized.startsWith(path.resolve(paths.rawDir) + path.sep)) {
+    return "raw";
+  }
+  if (normalized.startsWith(path.resolve(paths.systemDir) + path.sep)) {
+    return "system";
+  }
+  return "other";
+}
+
+function getManagedFileTypeLabel(type) {
+  const labels = {
+    ai: "AI 输出",
+    upload: "网页上传",
+    raw: "原始资料",
+    system: "系统配置",
+    other: "其他",
+  };
+  return labels[type] || type;
+}
+
+async function listManagedFiles(spaceId = DEFAULT_SPACE_ID, { type = "all", query = "" } = {}) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const roots = [
+    paths.rawDir,
+    paths.knowledgeDir,
+    paths.systemDir,
+  ];
+  const files = [];
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+
+  for (const rootDir of roots) {
+    const found = await listFilesRecursive(rootDir);
+    for (const filePath of found) {
+      const info = await stat(filePath);
+      const relativePath = path.relative(paths.root, filePath);
+      const fileType = getManagedFileType(filePath, paths);
+      if (type === "business" && !["ai", "upload", "raw"].includes(fileType)) {
+        continue;
+      }
+      if (type !== "all" && type !== "business" && fileType !== type) {
+        continue;
+      }
+      if (
+        normalizedQuery &&
+        !relativePath.toLowerCase().includes(normalizedQuery) &&
+        !path.basename(filePath).toLowerCase().includes(normalizedQuery)
+      ) {
+        continue;
+      }
+      files.push({
+        id: relativePath,
+        name: path.basename(filePath),
+        relativePath,
+        absolutePath: filePath,
+        extension: path.extname(filePath).toLowerCase() || "无扩展名",
+        type: fileType,
+        typeLabel: getManagedFileTypeLabel(fileType),
+        size: info.size,
+        modifiedAt: info.mtime.toISOString(),
+        canDelete: ["ai", "upload", "raw"].includes(fileType),
+      });
+    }
+  }
+
+  return files.sort((a, b) => String(b.modifiedAt).localeCompare(String(a.modifiedAt)));
+}
+
+function resolveManagedFilePath(spaceId, relativePath) {
+  const paths = getSpacePaths(spaceId);
+  const root = path.resolve(paths.root);
+  const targetPath = path.resolve(paths.root, String(relativePath || ""));
+  if (!targetPath.startsWith(root + path.sep)) {
+    throw new Error("文件路径不在当前项目库内。");
+  }
+  return { paths, targetPath };
+}
+
+async function deleteManagedFile(spaceId, relativePath) {
+  const { paths, targetPath } = resolveManagedFilePath(spaceId, relativePath);
+  const fileType = getManagedFileType(targetPath, paths);
+  if (!["ai", "upload", "raw"].includes(fileType)) {
+    throw new Error("系统配置文件不允许在网页端删除。");
+  }
+  const info = await stat(targetPath);
+  if (!info.isFile()) {
+    throw new Error("只能删除文件，不能删除文件夹。");
+  }
+  await rm(targetPath);
+  return {
+    relativePath: path.relative(paths.root, targetPath),
+    type: fileType,
+  };
 }
 
 async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
@@ -2134,6 +2236,51 @@ async function handleGetImportJob(requestUrl, response) {
   }
 }
 
+async function handleListManagedFiles(requestUrl, response) {
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  const type = requestUrl.searchParams.get("type") || "all";
+  const query = requestUrl.searchParams.get("q") || "";
+  try {
+    sendJson(response, 200, {
+      ok: true,
+      space,
+      files: await listManagedFiles(space, { type, query }),
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "读取资料列表失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleDeleteManagedFile(request, response) {
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  const relativePath = String(payload.relativePath || "").trim();
+  if (!relativePath) {
+    sendJson(response, 400, { error: "文件路径不能为空" });
+    return;
+  }
+
+  try {
+    const deleted = await deleteManagedFile(space, relativePath);
+    sendJson(response, 200, {
+      ok: true,
+      space,
+      deleted,
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "删除资料失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function handleVaultConfig(request, response) {
   if (!isLocalRequest(request)) {
     sendJson(response, 403, { error: "只有部署电脑本机可以修改知识库路径" });
@@ -2246,6 +2393,16 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "GET" && requestUrl.pathname.startsWith("/api/import-jobs/")) {
     await handleGetImportJob(requestUrl, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/files") {
+    await handleListManagedFiles(requestUrl, response);
+    return;
+  }
+
+  if (request.method === "DELETE" && requestUrl.pathname === "/api/files") {
+    await handleDeleteManagedFile(request, response);
     return;
   }
 

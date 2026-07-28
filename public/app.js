@@ -20,6 +20,10 @@ const kbProgressLabel = document.querySelector("#kb-progress-label");
 const kbProgressPercent = document.querySelector("#kb-progress-percent");
 const kbProgressBar = document.querySelector("#kb-progress-bar");
 const importJobsBox = document.querySelector("#import-jobs");
+const fileFilterType = document.querySelector("#file-filter-type");
+const fileSearch = document.querySelector("#file-search");
+const refreshFiles = document.querySelector("#refresh-files");
+const fileList = document.querySelector("#file-list");
 const kbSpaceAction = document.querySelector("#kb-space-action");
 const kbTargetSpace = document.querySelector("#kb-target-space");
 const kbExistingSpaceLabel = document.querySelector("#kb-existing-space-label");
@@ -390,6 +394,20 @@ function formatLatestUpdate(value) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function formatFileSize(bytes) {
+  const size = Number(bytes || 0);
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  if (size < 1024 * 1024 * 1024) {
+    return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  }
+  return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 function getCurrentSpace() {
@@ -771,6 +789,87 @@ async function loadImportJobs() {
   return payload.jobs || [];
 }
 
+function renderManagedFiles(files = []) {
+  if (!fileList) {
+    return;
+  }
+  if (!files.length) {
+    fileList.className = "file-list empty";
+    fileList.textContent = "没有找到符合条件的资料。";
+    return;
+  }
+
+  fileList.className = "file-list";
+  fileList.innerHTML = files
+    .map((file) => {
+      const deleteButton = file.canDelete
+        ? `<button type="button" class="text-danger" data-file-delete="${escapeHtml(file.relativePath)}">删除</button>`
+        : `<span class="file-action-disabled">受保护</span>`;
+      return `
+        <article class="file-row">
+          <div class="file-row-main">
+            <div>
+              <strong>${escapeHtml(file.name)}</strong>
+              <span>${escapeHtml(file.relativePath)}</span>
+            </div>
+            <span class="file-type">${escapeHtml(file.typeLabel || file.type)}</span>
+          </div>
+          <div class="file-row-meta">
+            <span>${escapeHtml(file.extension || "")}</span>
+            <span>${escapeHtml(formatFileSize(file.size))}</span>
+            <span>${escapeHtml(formatLatestUpdate(file.modifiedAt))}</span>
+          </div>
+          <div class="file-row-actions">
+            <button type="button" data-file-copy="${escapeHtml(file.absolutePath)}">复制路径</button>
+            ${deleteButton}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+async function loadManagedFiles() {
+  if (!fileList) {
+    return [];
+  }
+  fileList.className = "file-list empty";
+  fileList.textContent = "正在读取资料列表。";
+  const type = fileFilterType?.value || "all";
+  const query = fileSearch?.value?.trim() || "";
+  const response = await fetch(
+    `/api/files?space=${encodeURIComponent(getCurrentSpace())}&type=${encodeURIComponent(type)}&q=${encodeURIComponent(query)}`
+  );
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "资料列表读取失败");
+  }
+  renderManagedFiles(payload.files || []);
+  return payload.files || [];
+}
+
+async function deleteManagedFile(relativePath) {
+  const confirmed = window.confirm(`确定删除这个资料文件吗？\n\n${relativePath}`);
+  if (!confirmed) {
+    return;
+  }
+
+  const response = await fetch("/api/files", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      space: getCurrentSpace(),
+      relativePath,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "删除失败");
+  }
+  await loadManagedFiles();
+  await loadKnowledgeStatus();
+}
+
 async function pollImportJob(jobId) {
   if (!jobId || activeImportPolls.has(jobId)) {
     return;
@@ -1032,6 +1131,7 @@ spaceSelect?.addEventListener("change", async () => {
   setSpaceMessage(`已切换到：${getCurrentSpace()}`, "success");
   await loadKnowledgeStatus();
   await loadImportJobs();
+  await loadManagedFiles();
   resetCurrentChat();
   if (chatSessionsBox) {
     await initializeChatHistory();
@@ -1046,6 +1146,7 @@ kbTargetSpace?.addEventListener("change", async () => {
   setSpaceMessage(`已切换到：${kbTargetSpace.value}`, "success");
   await loadKnowledgeStatus();
   await loadImportJobs();
+  await loadManagedFiles();
   resetCurrentChat();
   if (chatSessionsBox) {
     await initializeChatHistory();
@@ -1057,6 +1158,34 @@ initVault?.addEventListener("click", initializeVaultPath);
 refreshStatus?.addEventListener("click", async () => {
   await loadKnowledgeStatus();
   await loadImportJobs();
+  await loadManagedFiles();
+});
+refreshFiles?.addEventListener("click", loadManagedFiles);
+fileFilterType?.addEventListener("change", loadManagedFiles);
+fileSearch?.addEventListener("input", () => {
+  window.clearTimeout(fileSearch._timer);
+  fileSearch._timer = window.setTimeout(loadManagedFiles, 280);
+});
+fileList?.addEventListener("click", async (event) => {
+  const copyButton = event.target.closest("[data-file-copy]");
+  if (copyButton) {
+    await navigator.clipboard.writeText(copyButton.dataset.fileCopy || "");
+    copyButton.textContent = "已复制";
+    window.setTimeout(() => {
+      copyButton.textContent = "复制路径";
+    }, 1200);
+    return;
+  }
+
+  const deleteButton = event.target.closest("[data-file-delete]");
+  if (deleteButton) {
+    try {
+      await deleteManagedFile(deleteButton.dataset.fileDelete);
+    } catch (error) {
+      fileList.className = "file-list empty error";
+      fileList.textContent = error instanceof Error ? error.message : "删除失败。";
+    }
+  }
 });
 toggleImportPanel?.addEventListener("click", () => openUtilityPanel(importPanel));
 toggleManagePanel?.addEventListener("click", () => openUtilityPanel(managePanel));
@@ -1080,6 +1209,7 @@ syncImportMode();
 loadSpaces()
   .then(loadKnowledgeStatus)
   .then(loadImportJobs)
+  .then(loadManagedFiles)
   .then(() => {
     if (chatSessionsBox) {
       return initializeChatHistory();

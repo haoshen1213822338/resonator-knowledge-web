@@ -122,6 +122,31 @@
             <div id="import-jobs" class="import-jobs empty">还没有入库任务。</div>
           </article>
 
+          <article class="admin-card file-manager-card" aria-labelledby="file-manager-title">
+            <div class="section-label" id="file-manager-title">资料管理</div>
+            <div class="file-manager-tools">
+              <label>
+                <span>资料类型</span>
+                <select id="file-filter-type">
+                  <option value="business">业务资料</option>
+                  <option value="all">全部文件</option>
+                  <option value="upload">网页上传</option>
+                  <option value="raw">原始资料</option>
+                  <option value="ai">AI 输出</option>
+                  <option value="system">系统配置</option>
+                </select>
+              </label>
+              <label>
+                <span>搜索文件</span>
+                <input id="file-search" placeholder="输入项目名、文件名或路径" />
+              </label>
+              <button type="button" class="ghost-button compact-button" id="refresh-files">
+                刷新列表
+              </button>
+            </div>
+            <div id="file-list" class="file-list empty">正在读取资料列表。</div>
+          </article>
+
           <article class="admin-card vault-panel hidden" id="vault-panel" aria-labelledby="vault-title">
             <div class="section-label" id="vault-title">本机知识库路径</div>
             <div class="vault-control">
