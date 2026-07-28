@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -57,6 +58,9 @@ const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   ".m4v",
 ]);
 const VIDEO_UPLOAD_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"]);
+const MAX_CONCURRENT_IMPORT_JOBS = 1;
+const activeImportJobs = new Set();
+const pendingImportJobs = [];
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -210,6 +214,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
   const systemDir = path.join(root, "99_系统配置");
   const chatDir = path.join(systemDir, "chat_sessions");
   const updateLogDir = path.join(systemDir, "update_logs");
+  const importJobDir = path.join(systemDir, "import_jobs");
   const importIndex = path.join(systemDir, "资料入库记录.md");
   return {
     id,
@@ -220,6 +225,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
     systemDir,
     chatDir,
     updateLogDir,
+    importJobDir,
     importIndex,
     folders: [
       rawDir,
@@ -229,6 +235,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
       chatDir,
       path.join(systemDir, "scripts"),
       updateLogDir,
+      importJobDir,
     ],
   };
 }
@@ -1636,28 +1643,32 @@ function getSafeUploadFileName(fileName) {
   return `${safeStem}${safeExtension}`;
 }
 
-function validateUploadFile(file) {
-  const extension = path.extname(file.fileName).toLowerCase();
+function validateUploadMetadata(fileName) {
+  const extension = path.extname(fileName).toLowerCase();
   if (!SUPPORTED_UPLOAD_EXTENSIONS.has(extension)) {
     throw new Error("目前支持上传 md、txt、csv、Word、PDF、Excel、PPT、图片和常见视频文件。");
   }
+}
+
+function validateUploadFile(file) {
+  validateUploadMetadata(file.fileName);
   if (file.buffer.length === 0) {
     throw new Error(`文件内容为空：${file.fileName}`);
   }
 }
 
-async function inspectUploadedFiles(spaceId, project, files) {
+async function inspectUploadMetadata(spaceId, project, files) {
   const paths = await ensureKnowledgeBase(spaceId);
   const previewFolderName = `${safePathSegment(project)}_正式上传时自动生成时间目录`;
   const previewUploadDir = path.join(paths.uploadRoot, previewFolderName);
 
   const inspectedFiles = files.map((file) => {
-    validateUploadFile(file);
-    const fileName = getSafeUploadFileName(file.fileName);
+    validateUploadMetadata(file.fileName || file.name);
+    const fileName = getSafeUploadFileName(file.fileName || file.name);
     return {
       fileName,
       extension: path.extname(fileName).toLowerCase(),
-      size: file.buffer.length,
+      size: Number(file.size || file.buffer?.length || 0),
       previewPath: path.join(previewUploadDir, fileName),
     };
   });
@@ -1693,6 +1704,212 @@ async function saveUploadedFiles(spaceId, project, files) {
   return { uploadDir, relativeInput, savedFiles, spaceRoot: paths.root };
 }
 
+function createImportJobId() {
+  return `job_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
+}
+
+function getImportJobPath(spaceId, jobId) {
+  const paths = getSpacePaths(spaceId);
+  return path.join(paths.importJobDir, `${safePathSegment(jobId)}.json`);
+}
+
+function sanitizeImportJob(job) {
+  return {
+    id: job.id,
+    space: job.space,
+    project: job.project,
+    mode: job.mode,
+    outputName: job.outputName,
+    status: job.status,
+    phase: job.phase,
+    progress: job.progress,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    uploadDir: job.uploadDir,
+    savedFiles: job.savedFiles || [],
+    outputPath: job.outputPath,
+    logPath: job.logPath,
+    stdout: job.stdout || "",
+    error: job.error || "",
+  };
+}
+
+async function readImportJob(spaceId, jobId) {
+  const jobPath = getImportJobPath(spaceId, jobId);
+  const content = await readFile(jobPath, "utf8");
+  return JSON.parse(content);
+}
+
+async function writeImportJob(job) {
+  const paths = await ensureKnowledgeBase(job.space);
+  const jobPath = path.join(paths.importJobDir, `${safePathSegment(job.id)}.json`);
+  const payload = {
+    ...job,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeFile(jobPath, JSON.stringify(payload, null, 2), "utf8");
+  return payload;
+}
+
+async function patchImportJob(spaceId, jobId, patch) {
+  const job = await readImportJob(spaceId, jobId);
+  return writeImportJob({
+    ...job,
+    ...patch,
+  });
+}
+
+async function listImportJobs(spaceId, limit = 30) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const files = await readdir(paths.importJobDir, { withFileTypes: true });
+  const jobs = [];
+  for (const entry of files) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) {
+      continue;
+    }
+    try {
+      const content = await readFile(path.join(paths.importJobDir, entry.name), "utf8");
+      jobs.push(sanitizeImportJob(JSON.parse(content)));
+    } catch {
+      // Ignore broken job records so the history page remains usable.
+    }
+  }
+  return jobs
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+    .slice(0, limit);
+}
+
+async function resumePendingImportJobs() {
+  const spaces = await listSpaces();
+  for (const space of spaces) {
+    const jobs = await listImportJobs(space.id, 100);
+    for (const job of jobs) {
+      if (job.status !== "queued" && job.status !== "running") {
+        continue;
+      }
+      await patchImportJob(space.id, job.id, {
+        status: "queued",
+        phase: "服务重启后等待继续处理",
+        progress: Math.max(10, Math.min(Number(job.progress || 10), 40)),
+      });
+      enqueueImportJob(space.id, job.id);
+    }
+  }
+}
+
+function enqueueImportJob(spaceId, jobId) {
+  const key = `${spaceId}:${jobId}`;
+  if (
+    activeImportJobs.has(key) ||
+    pendingImportJobs.some((item) => item.key === key)
+  ) {
+    return;
+  }
+  pendingImportJobs.push({ key, spaceId, jobId });
+  setTimeout(processImportQueue, 0);
+}
+
+async function processImportQueue() {
+  if (activeImportJobs.size >= MAX_CONCURRENT_IMPORT_JOBS) {
+    return;
+  }
+  const next = pendingImportJobs.shift();
+  if (!next) {
+    return;
+  }
+
+  activeImportJobs.add(next.key);
+  try {
+    await runImportJob(next.spaceId, next.jobId);
+  } finally {
+    activeImportJobs.delete(next.key);
+    setTimeout(processImportQueue, 0);
+  }
+}
+
+async function runImportJob(spaceId, jobId) {
+  try {
+    let job = await patchImportJob(spaceId, jobId, {
+      status: "running",
+      phase: "解析上传资料",
+      progress: 42,
+    });
+    const paths = await ensureKnowledgeBase(job.space);
+    const documents = await loadUploadedDocuments(job.savedFiles, paths.root);
+
+    job = await patchImportJob(spaceId, jobId, {
+      status: "running",
+      phase: "AI 整理资料",
+      progress: 76,
+    });
+    const organizedContent = await callOrganizationApi({
+      project: job.project,
+      mode: job.mode,
+      documents,
+    });
+
+    job = await patchImportJob(spaceId, jobId, {
+      status: "running",
+      phase: "写入知识库",
+      progress: 92,
+    });
+    const written = await writeKnowledgeOutput({
+      spaceId: job.space,
+      project: job.project,
+      mode: job.mode,
+      outputName: job.outputName,
+      savedFiles: job.savedFiles,
+      content: organizedContent,
+    });
+
+    await patchImportJob(spaceId, jobId, {
+      status: "completed",
+      phase: "已完成",
+      progress: 100,
+      outputPath: written.outputPath,
+      logPath: written.logPath,
+      stdout: [
+        `知识整理已生成：${written.outputPath}`,
+        `更新日志已记录：${written.logPath}`,
+        `原始资料目录：${job.uploadDir}`,
+      ].join("\n"),
+    });
+  } catch (error) {
+    await patchImportJob(spaceId, jobId, {
+      status: "failed",
+      phase: "处理失败",
+      progress: 100,
+      error: error instanceof Error ? error.message : String(error),
+    }).catch(() => {});
+  }
+}
+
+async function createImportJob({ space, project, mode, outputName, saved }) {
+  const now = new Date().toISOString();
+  const job = await writeImportJob({
+    id: createImportJobId(),
+    space,
+    project,
+    mode,
+    outputName,
+    status: "queued",
+    phase: "等待后台处理",
+    progress: 25,
+    createdAt: now,
+    updatedAt: now,
+    uploadDir: saved.uploadDir,
+    savedFiles: saved.savedFiles,
+    outputPath: "",
+    logPath: "",
+    stdout: "",
+    error: "",
+  });
+
+  enqueueImportJob(space, job.id);
+
+  return job;
+}
+
 async function handleImportKnowledge(request, response) {
   try {
     const bodyBuffer = await readRequestBuffer(request);
@@ -1718,7 +1935,7 @@ async function handleImportKnowledge(request, response) {
 
     let result;
     if (dryRun) {
-      const inspection = await inspectUploadedFiles(space, project, files);
+      const inspection = await inspectUploadMetadata(space, project, files);
       const totalBytes = inspection.inspectedFiles.reduce((total, item) => total + item.size, 0);
       const hasVideo = inspection.inspectedFiles.some((item) =>
         VIDEO_UPLOAD_EXTENSIONS.has(item.extension)
@@ -1743,25 +1960,22 @@ async function handleImportKnowledge(request, response) {
       };
     } else {
       const saved = await saveUploadedFiles(space, project, files);
-      const documents = await loadUploadedDocuments(saved.savedFiles, saved.spaceRoot);
-      const organizedContent = await callOrganizationApi({ project, mode, documents });
-      const written = await writeKnowledgeOutput({
-        spaceId: space,
+      const job = await createImportJob({
+        space,
         project,
         mode,
         outputName,
-        savedFiles: saved.savedFiles,
-        content: organizedContent,
+        saved,
       });
       result = {
         stdout: [
-          `知识整理已生成：${written.outputPath}`,
-          `更新日志已记录：${written.logPath}`,
+          `入库任务已提交：${job.id}`,
+          "后台会继续解析资料、调用 AI 整理并写入知识库。",
           `原始资料目录：${saved.uploadDir}`,
         ].join("\n"),
         stderr: "",
-        outputPath: written.outputPath,
-        logPath: written.logPath,
+        job: sanitizeImportJob(job),
+        jobId: job.id,
         uploadDir: saved.uploadDir,
         savedFiles: saved.savedFiles,
       };
@@ -1775,12 +1989,73 @@ async function handleImportKnowledge(request, response) {
       savedFiles: result.savedFiles || [],
       stdout: result.stdout.trim(),
       stderr: result.stderr.trim(),
+      jobId: result.jobId,
+      job: result.job,
       outputPath: result.outputPath,
       logPath: result.logPath,
     });
   } catch (error) {
     sendJson(response, 500, {
       error: "资料上传或整理失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleImportPrecheck(request, response) {
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  const project = String(payload.project || "未命名项目").trim();
+  const mode = String(payload.mode || "mixed").trim();
+  const files = Array.isArray(payload.files) ? payload.files : [];
+
+  try {
+    if (!project) {
+      sendJson(response, 400, { error: "项目名称不能为空" });
+      return;
+    }
+    if (!files.length) {
+      sendJson(response, 400, { error: "请先选择要检查的资料文件" });
+      return;
+    }
+    if (!["project", "faq", "sop", "analysis", "mixed"].includes(mode)) {
+      sendJson(response, 400, { error: "整理类型不支持" });
+      return;
+    }
+
+    const inspection = await inspectUploadMetadata(space, project, files);
+    const totalBytes = inspection.inspectedFiles.reduce((total, item) => total + item.size, 0);
+    const hasVideo = inspection.inspectedFiles.some((item) =>
+      VIDEO_UPLOAD_EXTENSIONS.has(item.extension)
+    );
+    sendJson(response, 200, {
+      ok: true,
+      dryRun: true,
+      space,
+      uploadDir: inspection.previewUploadDir,
+      savedFiles: [],
+      stdout: [
+        "预检查完成：没有上传文件内容，没有保存文件，没有解析正文，没有调用 AI。",
+        `项目：${project}`,
+        `模式：${mode}`,
+        `输入文件数：${inspection.inspectedFiles.length}`,
+        `文件总大小：${(totalBytes / 1024 / 1024).toFixed(1)} MB`,
+        `正式上传时将保存到：${inspection.previewUploadDir}`,
+        hasVideo ? "提示：视频会在正式上传整理时抽取音频、转文字和关键帧 OCR，耗时会明显更久。" : "",
+        ...inspection.inspectedFiles.map(
+          (item) =>
+            `- ${item.fileName} / ${(item.size / 1024 / 1024).toFixed(1)} MB / ${item.extension}`
+        ),
+      ].join("\n"),
+      stderr: "",
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "资料预检查失败",
       detail: error instanceof Error ? error.message : String(error),
     });
   }
@@ -1813,6 +2088,47 @@ async function handleCreateSpace(request, response) {
   } catch (error) {
     sendJson(response, 500, {
       error: "创建项目库失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleListImportJobs(requestUrl, response) {
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  const limit = Number(requestUrl.searchParams.get("limit") || 30);
+  try {
+    sendJson(response, 200, {
+      ok: true,
+      space,
+      jobs: await listImportJobs(space, Number.isFinite(limit) ? limit : 30),
+    });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "读取入库任务历史失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleGetImportJob(requestUrl, response) {
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  const jobId = decodeURIComponent(requestUrl.pathname.split("/").pop() || "");
+  if (!jobId) {
+    sendJson(response, 400, { error: "任务编号不能为空" });
+    return;
+  }
+
+  try {
+    const job = await readImportJob(space, jobId);
+    sendJson(response, 200, {
+      ok: true,
+      space,
+      job: sanitizeImportJob(job),
+    });
+  } catch (error) {
+    const statusCode = error?.code === "ENOENT" ? 404 : 500;
+    sendJson(response, statusCode, {
+      error: statusCode === 404 ? "没有找到这个入库任务" : "读取入库任务失败",
       detail: error instanceof Error ? error.message : String(error),
     });
   }
@@ -1918,6 +2234,21 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && requestUrl.pathname === "/api/import-precheck") {
+    await handleImportPrecheck(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/import-jobs") {
+    await handleListImportJobs(requestUrl, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname.startsWith("/api/import-jobs/")) {
+    await handleGetImportJob(requestUrl, response);
+    return;
+  }
+
   if (request.method === "GET" && requestUrl.pathname === "/api/spaces") {
     sendJson(response, 200, {
       ok: true,
@@ -1988,6 +2319,7 @@ const server = createServer(async (request, response) => {
 });
 
 await ensureKnowledgeBase(DEFAULT_SPACE_ID);
+await resumePendingImportJobs();
 
 server.listen(PORT, () => {
   console.log(`知识库网页已启动：http://localhost:${PORT}`);

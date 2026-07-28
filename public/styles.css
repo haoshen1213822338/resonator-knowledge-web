@@ -805,6 +805,94 @@ button:disabled {
   transition: width 240ms ease;
 }
 
+.import-history-card {
+  align-self: start;
+}
+
+.import-jobs {
+  display: grid;
+  gap: 10px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.import-jobs.empty {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.import-job {
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  padding: 11px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.import-job-main,
+.import-job-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.import-job-main strong {
+  display: block;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.import-job-main span,
+.import-job-meta,
+.import-job p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.import-job-meta {
+  margin-top: 8px;
+}
+
+.job-status {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.job-status.completed {
+  color: var(--success);
+}
+
+.job-status.failed {
+  color: var(--warning);
+}
+
+.job-status.running,
+.job-status.queued {
+  color: #f2d17a;
+}
+
+.import-job-track {
+  height: 6px;
+  margin-top: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.import-job-track div {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8cc8ff, #f2d17a);
+}
+
+.import-job p {
+  margin: 9px 0 0;
+  word-break: break-word;
+}
+
 .vault-message,
 .space-message {
   margin: 10px 0 0;

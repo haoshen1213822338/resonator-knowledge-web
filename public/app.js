@@ -19,6 +19,7 @@ const kbProgress = document.querySelector("#kb-progress");
 const kbProgressLabel = document.querySelector("#kb-progress-label");
 const kbProgressPercent = document.querySelector("#kb-progress-percent");
 const kbProgressBar = document.querySelector("#kb-progress-bar");
+const importJobsBox = document.querySelector("#import-jobs");
 const kbSpaceAction = document.querySelector("#kb-space-action");
 const kbTargetSpace = document.querySelector("#kb-target-space");
 const kbExistingSpaceLabel = document.querySelector("#kb-existing-space-label");
@@ -46,6 +47,7 @@ const toggleManagePanel = document.querySelector("#toggle-manage-panel");
 const root = document.documentElement;
 let currentSessionId = localStorage.getItem("currentChatSessionId") || "";
 let currentMessages = [];
+const activeImportPolls = new Map();
 const pointer = {
   x: window.innerWidth / 2,
   y: window.innerHeight * 0.35,
@@ -691,6 +693,128 @@ async function loadKnowledgeStatus() {
   }
 }
 
+function getJobStatusText(status) {
+  const labels = {
+    queued: "等待中",
+    running: "处理中",
+    completed: "已完成",
+    failed: "失败",
+  };
+  return labels[status] || status || "未知";
+}
+
+function renderImportJobs(jobs = []) {
+  if (!importJobsBox) {
+    return;
+  }
+  if (!jobs.length) {
+    importJobsBox.className = "import-jobs empty";
+    importJobsBox.textContent = "还没有入库任务。";
+    return;
+  }
+
+  importJobsBox.className = "import-jobs";
+  importJobsBox.innerHTML = jobs
+    .map((job) => {
+      const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+      const statusClass = `job-status ${escapeHtml(job.status || "unknown")}`;
+      const fileCount = job.savedFiles?.length || 0;
+      const detail = job.error || job.stdout || job.uploadDir || "";
+      return `
+        <article class="import-job" data-job-id="${escapeHtml(job.id)}">
+          <div class="import-job-main">
+            <div>
+              <strong>${escapeHtml(job.project || "未命名项目")}</strong>
+              <span>${escapeHtml(job.phase || getJobStatusText(job.status))}</span>
+            </div>
+            <span class="${statusClass}">${escapeHtml(getJobStatusText(job.status))}</span>
+          </div>
+          <div class="import-job-meta">
+            <span>${escapeHtml(formatLatestUpdate(job.createdAt))}</span>
+            <span>${fileCount} 个文件</span>
+            <span>${progress}%</span>
+          </div>
+          <div class="import-job-track">
+            <div style="width: ${progress}%"></div>
+          </div>
+          ${detail ? `<p>${escapeHtml(detail).slice(0, 240)}</p>` : ""}
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function clearImportPolls() {
+  for (const timerId of activeImportPolls.values()) {
+    window.clearTimeout(timerId);
+  }
+  activeImportPolls.clear();
+}
+
+async function loadImportJobs() {
+  if (!importJobsBox) {
+    return [];
+  }
+  const response = await fetch(
+    `/api/import-jobs?space=${encodeURIComponent(getCurrentSpace())}&limit=20`
+  );
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "入库任务历史读取失败");
+  }
+  renderImportJobs(payload.jobs || []);
+  for (const job of payload.jobs || []) {
+    if (job.status === "queued" || job.status === "running") {
+      pollImportJob(job.id);
+    }
+  }
+  return payload.jobs || [];
+}
+
+async function pollImportJob(jobId) {
+  if (!jobId || activeImportPolls.has(jobId)) {
+    return;
+  }
+
+  const poll = async () => {
+    try {
+      const response = await fetch(
+        `/api/import-jobs/${encodeURIComponent(jobId)}?space=${encodeURIComponent(getCurrentSpace())}`
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.detail || payload.error || "任务状态读取失败");
+      }
+
+      const job = payload.job;
+      setUploadProgress(job.progress || 0, job.phase || getJobStatusText(job.status));
+      if (job.status === "completed") {
+        kbStatus.className = "update-status success";
+        kbStatus.textContent = job.stdout || "入库任务已完成。";
+        activeImportPolls.delete(jobId);
+        await loadKnowledgeStatus();
+        await loadImportJobs();
+        return;
+      }
+      if (job.status === "failed") {
+        kbStatus.className = "update-status error";
+        kbStatus.textContent = job.error || "入库任务失败。";
+        activeImportPolls.delete(jobId);
+        await loadImportJobs();
+        return;
+      }
+      activeImportPolls.set(jobId, window.setTimeout(poll, 2500));
+    } catch (error) {
+      activeImportPolls.delete(jobId);
+      kbStatus.className = "update-status error";
+      kbStatus.textContent =
+        error instanceof Error ? error.message : "任务状态读取失败。";
+    }
+  };
+
+  activeImportPolls.set(jobId, window.setTimeout(poll, 900));
+}
+
 function setUpdateLoading(message) {
   if (!kbStatus || !kbDryRun || !kbUpdate) {
     return;
@@ -754,13 +878,41 @@ function sendImportRequest(formData, { dryRun, hasVideo }) {
         reject(new Error(payload.detail || payload.error || "更新失败"));
         return;
       }
-      setUploadProgress(100, dryRun ? "预检查完成" : "已写入知识库");
+      if (payload.jobId && !dryRun) {
+        setUploadProgress(payload.job?.progress || 60, "后台任务已提交");
+      } else {
+        setUploadProgress(100, dryRun ? "预检查完成" : "已写入知识库");
+      }
       resolve(payload);
     };
     request.onerror = () => reject(new Error("网络连接中断，上传没有完成。"));
     request.onabort = () => reject(new Error("上传已取消。"));
     request.send(formData);
   });
+}
+
+async function sendPrecheckRequest({ targetSpace, project, mode, files }) {
+  setUploadProgress(35, "正在检查文件信息");
+  const response = await fetch("/api/import-precheck", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      space: targetSpace,
+      project,
+      mode,
+      files: files.map((file) => ({
+        name: file.name,
+        size: file.size,
+        type: file.type,
+      })),
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || "预检查失败");
+  }
+  setUploadProgress(100, "预检查完成");
+  return payload;
 }
 
 function setUpdateIdle() {
@@ -794,6 +946,19 @@ async function runKnowledgeUpdate(dryRun) {
 
   try {
     const targetSpace = await resolveImportSpace();
+    if (dryRun) {
+      const payload = await sendPrecheckRequest({
+        targetSpace,
+        project: kbProject.value.trim(),
+        mode: kbMode.value,
+        files: selectedFiles,
+      });
+      kbStatus.className = "update-status success";
+      kbStatus.textContent = payload.stdout || "预检查完成。";
+      await loadKnowledgeStatus();
+      return;
+    }
+
     const formData = new FormData();
     formData.append("space", targetSpace);
     formData.append("project", kbProject.value.trim());
@@ -811,6 +976,10 @@ async function runKnowledgeUpdate(dryRun) {
       ? `\n\n原始资料已保存：\n${payload.savedFiles.join("\n")}`
       : "";
     kbStatus.textContent = `${payload.stdout || "更新完成。"}${saved}`;
+    if (payload.jobId) {
+      await loadImportJobs();
+      await pollImportJob(payload.jobId);
+    }
     await loadKnowledgeStatus();
   } catch (error) {
     kbStatus.className = "update-status error";
@@ -855,24 +1024,28 @@ questionInput?.addEventListener("keydown", (event) => {
 });
 
 spaceSelect?.addEventListener("change", async () => {
+  clearImportPolls();
   localStorage.setItem("currentKnowledgeSpace", getCurrentSpace());
   if (kbTargetSpace) {
     kbTargetSpace.value = getCurrentSpace();
   }
   setSpaceMessage(`已切换到：${getCurrentSpace()}`, "success");
   await loadKnowledgeStatus();
+  await loadImportJobs();
   resetCurrentChat();
   if (chatSessionsBox) {
     await initializeChatHistory();
   }
 });
 kbTargetSpace?.addEventListener("change", async () => {
+  clearImportPolls();
   if (spaceSelect) {
     spaceSelect.value = kbTargetSpace.value;
   }
   localStorage.setItem("currentKnowledgeSpace", kbTargetSpace.value);
   setSpaceMessage(`已切换到：${kbTargetSpace.value}`, "success");
   await loadKnowledgeStatus();
+  await loadImportJobs();
   resetCurrentChat();
   if (chatSessionsBox) {
     await initializeChatHistory();
@@ -881,7 +1054,10 @@ kbTargetSpace?.addEventListener("change", async () => {
 kbSpaceAction?.addEventListener("change", syncImportMode);
 createSpace?.addEventListener("click", createKnowledgeSpace);
 initVault?.addEventListener("click", initializeVaultPath);
-refreshStatus?.addEventListener("click", loadKnowledgeStatus);
+refreshStatus?.addEventListener("click", async () => {
+  await loadKnowledgeStatus();
+  await loadImportJobs();
+});
 toggleImportPanel?.addEventListener("click", () => openUtilityPanel(importPanel));
 toggleManagePanel?.addEventListener("click", () => openUtilityPanel(managePanel));
 newChatButton?.addEventListener("click", resetCurrentChat);
@@ -903,6 +1079,7 @@ kbUpdate?.addEventListener("click", () => runKnowledgeUpdate(false));
 syncImportMode();
 loadSpaces()
   .then(loadKnowledgeStatus)
+  .then(loadImportJobs)
   .then(() => {
     if (chatSessionsBox) {
       return initializeChatHistory();
