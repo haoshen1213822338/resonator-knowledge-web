@@ -87,6 +87,10 @@ body::after {
   padding: 14px;
 }
 
+body:has(.admin-shell) {
+  overflow: auto;
+}
+
 .left-rail,
 .right-rail,
 .chat-workspace,
@@ -106,6 +110,14 @@ body::after {
   flex-direction: column;
   gap: 18px;
   padding: 18px;
+}
+
+.admin-shell .left-rail {
+  position: sticky;
+  top: 14px;
+  align-self: start;
+  max-height: calc(100dvh - 28px);
+  overflow: auto;
 }
 
 .right-rail {
@@ -128,9 +140,9 @@ body::after {
 
 .admin-workspace {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
   gap: 14px;
-  overflow: auto;
+  overflow: visible;
   padding: 18px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.038), rgba(255, 255, 255, 0.014)),
@@ -943,9 +955,8 @@ button:disabled {
 .file-list {
   display: grid;
   gap: 9px;
-  max-height: 520px;
   margin-top: 12px;
-  overflow: auto;
+  overflow: visible;
 }
 
 .file-list.empty {
