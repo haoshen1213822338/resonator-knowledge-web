@@ -47,6 +47,20 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 
+def emit_progress(phase: str, progress: int | float | None = None, detail: str = "") -> None:
+    """Write machine-readable progress events to stderr for the Node backend."""
+
+    payload: dict[str, Any] = {
+        "type": "progress",
+        "phase": phase,
+    }
+    if progress is not None:
+        payload["progress"] = max(0, min(100, int(progress)))
+    if detail:
+        payload["detail"] = detail
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
 def read_text_file(path: Path) -> str:
     """Read a text-like file with practical encoding fallbacks."""
 
@@ -61,6 +75,7 @@ def read_text_file(path: Path) -> str:
 def extract_docx(path: Path) -> str:
     """Extract paragraphs and tables from a Word document."""
 
+    emit_progress("读取 Word 文档", 18, path.name)
     from docx import Document
 
     document = Document(path)
@@ -86,6 +101,7 @@ def extract_docx(path: Path) -> str:
 def extract_pdf(path: Path) -> str:
     """Extract text and simple tables from a PDF."""
 
+    emit_progress("读取 PDF 页面", 18, path.name)
     try:
         import pdfplumber
     except ImportError:
@@ -114,6 +130,7 @@ def extract_pdf(path: Path) -> str:
 def extract_xlsx(path: Path) -> str:
     """Extract visible cell values from an Excel workbook."""
 
+    emit_progress("读取 Excel 工作表", 18, path.name)
     from openpyxl import load_workbook
 
     workbook = load_workbook(path, data_only=True, read_only=True)
@@ -136,6 +153,7 @@ def extract_xlsx(path: Path) -> str:
 def extract_pptx(path: Path) -> str:
     """Extract slide text and table cells from a PowerPoint file."""
 
+    emit_progress("读取 PPT 页面", 18, path.name)
     from pptx import Presentation
 
     presentation = Presentation(path)
@@ -159,9 +177,11 @@ def extract_pptx(path: Path) -> str:
     return "\n\n".join(parts)
 
 
-def extract_image(path: Path) -> str:
+def extract_image(path: Path, report_progress: bool = True) -> str:
     """Extract visible text from an image by OCR."""
 
+    if report_progress:
+        emit_progress("图片 OCR 识别", 22, path.name)
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError as exc:
@@ -270,6 +290,7 @@ def format_timestamp(seconds: float) -> str:
 def extract_video(path: Path) -> str:
     """Extract speech transcript and frame OCR from a video."""
 
+    emit_progress("准备视频解析", 5, path.name)
     ffmpeg = require_ffmpeg()
     interval = max(1, int(os.environ.get("VIDEO_FRAME_INTERVAL_SECONDS", "10")))
     max_frames = max(1, int(os.environ.get("VIDEO_MAX_KEYFRAMES", "120")))
@@ -279,6 +300,7 @@ def extract_video(path: Path) -> str:
         audio_path = temp_path / "audio.wav"
         frame_pattern = str(temp_path / "frame_%05d.jpg")
 
+        emit_progress("抽取视频音频", 14, path.name)
         run_command([
             ffmpeg,
             "-y",
@@ -292,10 +314,12 @@ def extract_video(path: Path) -> str:
             str(audio_path),
         ])
 
+        emit_progress("语音转文字", 36, path.name)
         transcript = transcribe_audio(audio_path)
 
         frame_ocr_lines: list[str] = []
         try:
+            emit_progress("抽取关键帧", 68, path.name)
             run_command([
                 ffmpeg,
                 "-y",
@@ -308,8 +332,14 @@ def extract_video(path: Path) -> str:
                 frame_pattern,
             ])
             frames = sorted(temp_path.glob("frame_*.jpg"))
+            total_frames = max(1, len(frames))
             for index, frame in enumerate(frames):
-                ocr_text = extract_image(frame).strip()
+                emit_progress(
+                    "关键帧 OCR",
+                    74 + (index / total_frames) * 20,
+                    f"{index + 1}/{total_frames}",
+                )
+                ocr_text = extract_image(frame, report_progress=False).strip()
                 if ocr_text:
                     frame_ocr_lines.append(
                         f"### {format_timestamp(index * interval)}\n{ocr_text}"
@@ -330,6 +360,7 @@ def extract_video(path: Path) -> str:
 def extract_file(path: Path) -> str:
     """Extract text from one supported file."""
 
+    emit_progress("开始解析文件", 1, path.name)
     extension = path.suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"不支持的文件类型：{extension}")
@@ -356,6 +387,7 @@ def build_payload(path: Path) -> dict[str, Any]:
     """Build the JSON response consumed by the Node backend."""
 
     content = extract_file(path).strip()
+    emit_progress("文件解析完成", 100, path.name)
     return {
         "ok": True,
         "file": str(path),

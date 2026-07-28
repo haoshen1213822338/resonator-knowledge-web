@@ -88,15 +88,77 @@ function renderConversation(messages = currentMessages) {
     .map((message) => {
       const roleLabel = message.role === "user" ? "你" : "Agent";
       const pendingClass = message.pending ? " pending" : "";
+      const content = message.role === "assistant"
+        ? renderAssistantContent(message.content)
+        : escapeHtml(message.content);
       return `
         <div class="chat-message ${message.role}${pendingClass}">
           <div class="message-role">${roleLabel}</div>
-          <div class="message-content">${escapeHtml(message.content)}</div>
+          <div class="message-content">${content}</div>
         </div>
       `;
     })
     .join("");
   conversationBox.scrollTop = conversationBox.scrollHeight;
+}
+
+function renderAssistantContent(content) {
+  const lines = String(content || "").split(/\r?\n/);
+  const html = [];
+  let listOpen = false;
+
+  const closeList = () => {
+    if (listOpen) {
+      html.push("</ul>");
+      listOpen = false;
+    }
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      closeList();
+      continue;
+    }
+
+    const heading = line.match(/^#{1,3}\s+(.+)$/);
+    if (heading) {
+      closeList();
+      html.push(`<h3>${formatInlineMarkdown(heading[1])}</h3>`);
+      continue;
+    }
+
+    const labelHeading = line.match(/^(结论|依据|推断|建议|建议下一步|待确认|参考)[:：]\s*(.*)$/);
+    if (labelHeading) {
+      closeList();
+      html.push(
+        `<h3>${escapeHtml(labelHeading[1])}</h3>${labelHeading[2] ? `<p>${formatInlineMarkdown(labelHeading[2])}</p>` : ""}`
+      );
+      continue;
+    }
+
+    const bullet = line.match(/^[-*]\s+(.+)$/) || line.match(/^\d+[.、]\s+(.+)$/);
+    if (bullet) {
+      if (!listOpen) {
+        html.push("<ul>");
+        listOpen = true;
+      }
+      html.push(`<li>${formatInlineMarkdown(bullet[1])}</li>`);
+      continue;
+    }
+
+    closeList();
+    html.push(`<p>${formatInlineMarkdown(line)}</p>`);
+  }
+
+  closeList();
+  return html.join("");
+}
+
+function formatInlineMarkdown(value) {
+  return escapeHtml(value)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
 function renderChatSessions(sessions = []) {
@@ -737,6 +799,9 @@ function renderImportJobs(jobs = []) {
       const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
       const statusClass = `job-status ${escapeHtml(job.status || "unknown")}`;
       const fileCount = job.savedFiles?.length || 0;
+      const currentFile = job.currentFile
+        ? `<span>当前：${escapeHtml(job.currentFile)}</span>`
+        : "";
       const detail = job.error || job.stdout || job.uploadDir || "";
       return `
         <article class="import-job" data-job-id="${escapeHtml(job.id)}">
@@ -750,6 +815,7 @@ function renderImportJobs(jobs = []) {
           <div class="import-job-meta">
             <span>${escapeHtml(formatLatestUpdate(job.createdAt))}</span>
             <span>${fileCount} 个文件</span>
+            ${currentFile}
             <span>${progress}%</span>
           </div>
           <div class="import-job-track">
@@ -886,7 +952,12 @@ async function pollImportJob(jobId) {
       }
 
       const job = payload.job;
-      setUploadProgress(job.progress || 0, job.phase || getJobStatusText(job.status));
+      setUploadProgress(
+        job.progress || 0,
+        job.currentFile
+          ? `${job.phase || getJobStatusText(job.status)} · ${job.currentFile}`
+          : job.phase || getJobStatusText(job.status)
+      );
       if (job.status === "completed") {
         kbStatus.className = "update-status success";
         kbStatus.textContent = job.stdout || "入库任务已完成。";

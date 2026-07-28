@@ -596,6 +596,8 @@ async function callAI(question, results, history = []) {
     "不要因为资料没有逐字写明就直接回答资料不足；先尝试从项目背景、时间线、需求、风险、流程和相似片段中总结可用判断。",
     "只有完全没有相关片段时，才说明资料不足，并给出建议补充哪些资料。",
     "回答要简洁、可执行，适合客服、管理员、项目负责人或接单人员直接使用。",
+    "回答体验要求：先给一句明确结论；简单问题用 3-5 句话回答；复杂问题再分成“依据”“推断”“建议下一步”“待确认”。",
+    "如果用户问怎么办、怎么做、下一步，优先输出可执行步骤，而不是长篇背景解释。",
     "你可以结合上一轮对话理解追问、省略指代和连续任务。",
     "不要输出手机号、订单号、账号、密码、验证码等敏感信息。",
     "最后用“参考：文件名”列出用到的知识文件。",
@@ -682,7 +684,23 @@ async function callOrganizationApi({ project, mode, documents }) {
   return text;
 }
 
-function runFileExtractor(filePath) {
+function parseExtractorProgressLine(line) {
+  const text = String(line || "").trim();
+  if (!text) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(text);
+    if (payload?.type === "progress") {
+      return payload;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function runFileExtractor(filePath, onProgress = null) {
   return new Promise((resolve, reject) => {
     const child = spawn(PARSER_PYTHON_CMD, [FILE_EXTRACTOR_SCRIPT, filePath], {
       cwd: __dirname,
@@ -695,26 +713,50 @@ function runFileExtractor(filePath) {
 
     let stdout = "";
     let stderr = "";
+    let stderrDiagnostic = "";
+    let stderrBuffer = "";
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      stderr += text;
+      stderrBuffer += text;
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop() || "";
+      for (const line of lines) {
+        const event = parseExtractorProgressLine(line);
+        if (event) {
+          if (onProgress) {
+            onProgress(event);
+          }
+          continue;
+        }
+        stderrDiagnostic += `${line}\n`;
+      }
     });
     child.on("error", (error) => {
       reject(error);
     });
     child.on("close", (code) => {
+      const pendingEvent = parseExtractorProgressLine(stderrBuffer);
+      if (pendingEvent) {
+        if (onProgress) {
+          onProgress(pendingEvent);
+        }
+      } else if (stderrBuffer.trim()) {
+        stderrDiagnostic += `${stderrBuffer}\n`;
+      }
       let payload;
       try {
         payload = JSON.parse(stdout || "{}");
       } catch {
-        reject(new Error(`文件解析器返回了无法读取的结果：${stderr || stdout}`));
+        reject(new Error(`文件解析器返回了无法读取的结果：${stderrDiagnostic || stdout}`));
         return;
       }
 
       if (code !== 0 || !payload.ok) {
-        reject(new Error(payload.error || stderr || `文件解析失败：${filePath}`));
+        reject(new Error(payload.error || stderrDiagnostic || `文件解析失败：${filePath}`));
         return;
       }
       resolve(payload);
@@ -727,10 +769,26 @@ function getExtractedFileName(filePath) {
   return `${parsed.name}_解析结果.md`;
 }
 
-async function loadUploadedDocuments(savedFiles, spaceRoot) {
+async function loadUploadedDocuments(savedFiles, spaceRoot, onProgress = null) {
   const documents = [];
-  for (const filePath of savedFiles) {
-    const parsed = await runFileExtractor(filePath);
+  const totalFiles = Math.max(1, savedFiles.length);
+  for (const [index, filePath] of savedFiles.entries()) {
+    const fileName = path.basename(filePath);
+    onProgress?.({
+      fileName,
+      fileIndex: index + 1,
+      totalFiles,
+      phase: `解析文件 ${index + 1}/${totalFiles}`,
+      progress: 0,
+    });
+    const parsed = await runFileExtractor(filePath, (event) => {
+      onProgress?.({
+        ...event,
+        fileName,
+        fileIndex: index + 1,
+        totalFiles,
+      });
+    });
     const extractedPath = path.join(path.dirname(filePath), getExtractedFileName(filePath));
     const extractedContent = [
       `# ${path.basename(filePath)} 解析结果`,
@@ -750,6 +808,13 @@ async function loadUploadedDocuments(savedFiles, spaceRoot) {
       relativePath: path.relative(spaceRoot, filePath),
       extractedPath,
       content: parsed.content || "",
+    });
+    onProgress?.({
+      fileName,
+      fileIndex: index + 1,
+      totalFiles,
+      phase: `文件 ${index + 1}/${totalFiles} 已解析`,
+      progress: 100,
     });
   }
   return documents;
@@ -1825,6 +1890,9 @@ function sanitizeImportJob(job) {
     status: job.status,
     phase: job.phase,
     progress: job.progress,
+    currentFile: job.currentFile || "",
+    fileIndex: job.fileIndex || 0,
+    totalFiles: job.totalFiles || 0,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     uploadDir: job.uploadDir,
@@ -1933,11 +2001,38 @@ async function runImportJob(spaceId, jobId) {
   try {
     let job = await patchImportJob(spaceId, jobId, {
       status: "running",
-      phase: "解析上传资料",
-      progress: 42,
+      phase: "准备解析上传资料",
+      progress: 28,
+      currentFile: "",
+      fileIndex: 0,
+      totalFiles: 0,
     });
     const paths = await ensureKnowledgeBase(job.space);
-    const documents = await loadUploadedDocuments(job.savedFiles, paths.root);
+    const progressState = {
+      lastWriteAt: 0,
+    };
+    const documents = await loadUploadedDocuments(job.savedFiles, paths.root, (event) => {
+      const now = Date.now();
+      if (now - progressState.lastWriteAt < 700 && Number(event.progress || 0) < 100) {
+        return;
+      }
+      progressState.lastWriteAt = now;
+      const totalFiles = Math.max(1, Number(event.totalFiles || job.savedFiles.length || 1));
+      const fileIndex = Math.max(1, Number(event.fileIndex || 1));
+      const fileBase = ((fileIndex - 1) / totalFiles) * 44;
+      const fileSlice = (Number(event.progress || 0) / 100) * (44 / totalFiles);
+      const progress = Math.max(30, Math.min(74, Math.round(30 + fileBase + fileSlice)));
+      patchImportJob(spaceId, jobId, {
+        status: "running",
+        phase: event.detail
+          ? `${event.phase}：${event.detail}`
+          : event.phase || `解析文件 ${fileIndex}/${totalFiles}`,
+        progress,
+        currentFile: event.fileName || "",
+        fileIndex,
+        totalFiles,
+      }).catch(() => {});
+    });
 
     job = await patchImportJob(spaceId, jobId, {
       status: "running",
