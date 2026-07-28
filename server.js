@@ -56,6 +56,7 @@ const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   ".webm",
   ".m4v",
 ]);
+const VIDEO_UPLOAD_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"]);
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -1693,16 +1694,27 @@ async function handleImportKnowledge(request, response) {
     const saved = await saveUploadedFiles(space, project, files);
     let result;
     if (dryRun) {
-      const documents = await loadUploadedDocuments(saved.savedFiles, saved.spaceRoot);
-      const totalChars = documents.reduce((total, item) => total + item.content.length, 0);
+      const fileStats = await Promise.all(
+        saved.savedFiles.map(async (filePath) => {
+          const info = await stat(filePath);
+          return {
+            filePath,
+            size: info.size,
+            extension: path.extname(filePath).toLowerCase(),
+          };
+        })
+      );
+      const totalBytes = fileStats.reduce((total, item) => total + item.size, 0);
+      const hasVideo = fileStats.some((item) => VIDEO_UPLOAD_EXTENSIONS.has(item.extension));
       result = {
         stdout: [
-          "Dry run: 不调用 API，不写入 90_AI输出。",
+          "Dry run: 不调用 API，不解析正文，不写入 90_AI输出。",
           `项目：${project}`,
           `模式：${mode}`,
-          `输入文件数：${documents.length}`,
-          `预计发送字符数：${Math.min(totalChars, 48_000)}`,
-          ...documents.map((item) => `- ${item.relativePath}`),
+          `输入文件数：${fileStats.length}`,
+          `文件总大小：${(totalBytes / 1024 / 1024).toFixed(1)} MB`,
+          hasVideo ? "提示：视频会在正式上传整理时抽取音频、转文字和关键帧 OCR，耗时会明显更久。" : "",
+          ...fileStats.map((item) => `- ${path.relative(saved.spaceRoot, item.filePath)}`),
         ].join("\n"),
         stderr: "",
       };

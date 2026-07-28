@@ -713,7 +713,17 @@ async function runKnowledgeUpdate(dryRun) {
     return;
   }
 
-  setUpdateLoading(dryRun ? "正在预检查上传资料..." : "正在上传并整理，可能需要几十秒...");
+  const selectedFiles = Array.from(kbFile.files || []);
+  const hasVideo = selectedFiles.some((file) =>
+    /\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(file.name)
+  );
+  setUpdateLoading(
+    dryRun
+      ? "正在预检查文件类型和保存路径..."
+      : hasVideo
+        ? "文件已开始上传。视频入库需要抽音频、转文字和关键帧识别，1GB 以上可能需要数分钟到十几分钟..."
+        : "正在上传并整理，可能需要几十秒..."
+  );
 
   try {
     const targetSpace = await resolveImportSpace();
