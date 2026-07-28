@@ -709,7 +709,7 @@ function setUpdateIdle() {
 async function runKnowledgeUpdate(dryRun) {
   if (!kbFile.files || kbFile.files.length === 0) {
     kbStatus.className = "update-status error";
-    kbStatus.textContent = "请先选择要上传的 md、txt、csv、Word、PDF、Excel 或 PPT 文件。";
+    kbStatus.textContent = "请先选择要上传的文档、图片、表格、演示文稿或视频文件。";
     return;
   }
 

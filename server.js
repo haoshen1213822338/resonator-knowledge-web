@@ -49,6 +49,12 @@ const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   ".jpeg",
   ".webp",
   ".bmp",
+  ".mp4",
+  ".mov",
+  ".mkv",
+  ".avi",
+  ".webm",
+  ".m4v",
 ]);
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
@@ -1590,7 +1596,7 @@ function safePathSegment(value) {
 function validateUploadFile(file) {
   const extension = path.extname(file.fileName).toLowerCase();
   if (!SUPPORTED_UPLOAD_EXTENSIONS.has(extension)) {
-    throw new Error("目前支持上传 .md、.txt、.csv、.docx、.pdf、.xlsx、.pptx 文件。");
+    throw new Error("目前支持上传 md、txt、csv、Word、PDF、Excel、PPT、图片和常见视频文件。");
   }
   if (file.buffer.length === 0) {
     throw new Error(`文件内容为空：${file.fileName}`);

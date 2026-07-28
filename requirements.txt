@@ -4,3 +4,4 @@ pypdf
 openpyxl
 python-pptx
 rapidocr-onnxruntime
+faster-whisper

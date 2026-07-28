@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +31,15 @@ SUPPORTED_EXTENSIONS = {
     ".jpeg",
     ".webp",
     ".bmp",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".webm",
+    ".m4v",
 }
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -178,6 +190,139 @@ def extract_image(path: Path) -> str:
     return "\n".join(lines)
 
 
+def require_ffmpeg() -> str:
+    """Return the ffmpeg executable path or raise a clear setup error."""
+
+    executable = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg")
+    if not executable:
+        raise RuntimeError(
+            "视频解析需要先安装 ffmpeg，并确保命令行可以直接运行 ffmpeg。"
+        )
+    return executable
+
+
+def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a command and return text output for diagnostics."""
+
+    return subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def transcribe_audio(audio_path: Path) -> str:
+    """Transcribe audio using faster-whisper first, then whisper if installed."""
+
+    model_name = os.environ.get("VIDEO_WHISPER_MODEL", "base")
+
+    try:
+      from faster_whisper import WhisperModel
+    except ImportError:
+      WhisperModel = None
+
+    if WhisperModel is not None:
+        model = WhisperModel(model_name, device=os.environ.get("VIDEO_WHISPER_DEVICE", "cpu"))
+        segments, _ = model.transcribe(str(audio_path), language="zh", vad_filter=True)
+        lines = []
+        for segment in segments:
+            text = segment.text.strip()
+            if text:
+                lines.append(f"- {format_timestamp(segment.start)} - {format_timestamp(segment.end)}：{text}")
+        return "\n".join(lines)
+
+    try:
+        import whisper
+    except ImportError as exc:
+        raise RuntimeError(
+            "视频语音转文字需要安装 faster-whisper 或 openai-whisper。"
+        ) from exc
+
+    model = whisper.load_model(model_name)
+    result = model.transcribe(str(audio_path), language="zh")
+    lines = []
+    for segment in result.get("segments", []):
+        text = str(segment.get("text", "")).strip()
+        if text:
+            lines.append(
+                f"- {format_timestamp(float(segment.get('start', 0)))} - "
+                f"{format_timestamp(float(segment.get('end', 0)))}：{text}"
+            )
+    return "\n".join(lines)
+
+
+def format_timestamp(seconds: float) -> str:
+    """Format seconds as HH:MM:SS."""
+
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def extract_video(path: Path) -> str:
+    """Extract speech transcript and frame OCR from a video."""
+
+    ffmpeg = require_ffmpeg()
+    interval = max(1, int(os.environ.get("VIDEO_FRAME_INTERVAL_SECONDS", "10")))
+    max_frames = max(1, int(os.environ.get("VIDEO_MAX_KEYFRAMES", "120")))
+
+    with tempfile.TemporaryDirectory(prefix="kb_video_") as temp_dir:
+        temp_path = Path(temp_dir)
+        audio_path = temp_path / "audio.wav"
+        frame_pattern = str(temp_path / "frame_%05d.jpg")
+
+        run_command([
+            ffmpeg,
+            "-y",
+            "-i",
+            str(path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(audio_path),
+        ])
+
+        transcript = transcribe_audio(audio_path)
+
+        frame_ocr_lines: list[str] = []
+        try:
+            run_command([
+                ffmpeg,
+                "-y",
+                "-i",
+                str(path),
+                "-vf",
+                f"fps=1/{interval}",
+                "-frames:v",
+                str(max_frames),
+                frame_pattern,
+            ])
+            frames = sorted(temp_path.glob("frame_*.jpg"))
+            for index, frame in enumerate(frames):
+                ocr_text = extract_image(frame).strip()
+                if ocr_text:
+                    frame_ocr_lines.append(
+                        f"### {format_timestamp(index * interval)}\n{ocr_text}"
+                    )
+        except Exception as exc:  # noqa: BLE001 - frame OCR is useful but optional.
+            frame_ocr_lines.append(f"关键帧 OCR 未完成：{exc}")
+
+    parts = [
+        "## 视频语音转文字",
+        transcript or "未识别到可用语音文字。",
+        "",
+        "## 视频画面文字 OCR",
+        "\n\n".join(frame_ocr_lines) or "未识别到画面文字。",
+    ]
+    return "\n".join(parts)
+
+
 def extract_file(path: Path) -> str:
     """Extract text from one supported file."""
 
@@ -197,6 +342,8 @@ def extract_file(path: Path) -> str:
         return extract_pptx(path)
     if extension in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
         return extract_image(path)
+    if extension in VIDEO_EXTENSIONS:
+        return extract_video(path)
 
     raise ValueError(f"不支持的文件类型：{extension}")
 
