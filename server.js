@@ -1530,25 +1530,54 @@ function parseMultipartForm(request, bodyBuffer) {
     throw new Error("上传请求缺少 multipart boundary。");
   }
 
-  const body = bodyBuffer.toString("latin1");
-  const parts = body.split(`--${boundary}`);
+  const boundaryBuffer = Buffer.from(`--${boundary}`, "utf8");
+  const headerSeparator = Buffer.from("\r\n\r\n", "utf8");
+  const lineBreak = Buffer.from("\r\n", "utf8");
   const fields = {};
   const files = [];
+  let cursor = bodyBuffer.indexOf(boundaryBuffer);
 
-  for (const rawPart of parts) {
-    if (!rawPart || rawPart === "--\r\n" || rawPart === "--") {
-      continue;
+  while (cursor !== -1) {
+    cursor += boundaryBuffer.length;
+
+    if (bodyBuffer[cursor] === 45 && bodyBuffer[cursor + 1] === 45) {
+      break;
+    }
+    if (bodyBuffer[cursor] === 13 && bodyBuffer[cursor + 1] === 10) {
+      cursor += 2;
     }
 
-    const part = rawPart.replace(/^\r\n/, "").replace(/\r\n--$/, "");
-    const separatorIndex = part.indexOf("\r\n\r\n");
+    const nextBoundary = bodyBuffer.indexOf(boundaryBuffer, cursor);
+    if (nextBoundary === -1) {
+      break;
+    }
+
+    let partEnd = nextBoundary;
+    if (
+      partEnd >= 2 &&
+      bodyBuffer[partEnd - 2] === 13 &&
+      bodyBuffer[partEnd - 1] === 10
+    ) {
+      partEnd -= 2;
+    }
+
+    const separatorIndex = bodyBuffer.indexOf(headerSeparator, cursor);
     if (separatorIndex === -1) {
+      cursor = nextBoundary;
+      continue;
+    }
+    if (separatorIndex > partEnd) {
+      cursor = nextBoundary;
       continue;
     }
 
-    const rawHeaders = part.slice(0, separatorIndex);
-    let content = part.slice(separatorIndex + 4);
-    if (content.endsWith("\r\n")) {
+    const rawHeaders = bodyBuffer.slice(cursor, separatorIndex).toString("utf8");
+    let content = bodyBuffer.slice(separatorIndex + headerSeparator.length, partEnd);
+    if (
+      content.length >= 2 &&
+      content[content.length - 2] === lineBreak[0] &&
+      content[content.length - 1] === lineBreak[1]
+    ) {
       content = content.slice(0, -2);
     }
 
@@ -1574,11 +1603,13 @@ function parseMultipartForm(request, bodyBuffer) {
         fieldName: disposition.name,
         fileName: disposition.filename,
         contentType: headers["content-type"] || "application/octet-stream",
-        buffer: Buffer.from(content, "latin1"),
+        buffer: content,
       });
     } else {
-      fields[disposition.name] = Buffer.from(content, "latin1").toString("utf8");
+      fields[disposition.name] = content.toString("utf8");
     }
+
+    cursor = nextBoundary;
   }
 
   return { fields, files };
