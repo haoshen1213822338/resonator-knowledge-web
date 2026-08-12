@@ -28,13 +28,21 @@
 
         <nav class="rail-actions" aria-label="知识库操作">
           <button type="button" class="primary-button" id="new-chat">新建对话</button>
-          <a class="ghost-button link-button" href="/admin">资料后台</a>
+          <a class="ghost-button link-button" id="admin-link" href="/admin">资料后台</a>
           <button type="button" class="ghost-button" id="refresh-status">刷新状态</button>
         </nav>
 
         <section class="history-block" aria-labelledby="history-title">
           <div class="section-label" id="history-title">历史对话</div>
           <div id="chat-sessions" class="chat-sessions empty">暂无历史对话。</div>
+        </section>
+
+        <section class="account-panel">
+          <div>
+            <strong id="current-user-name">正在读取账号</strong>
+            <span id="current-user-role">-</span>
+          </div>
+          <button type="button" class="icon-text-button" id="logout-button">退出</button>
         </section>
       </aside>
 

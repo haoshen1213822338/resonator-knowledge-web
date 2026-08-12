@@ -1,9 +1,10 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,6 +24,12 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || "https://api.deepseek.com")
 const AI_API_KEY = process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "";
 const AI_MODEL = process.env.AI_MODEL || "deepseek-v4-flash";
 const PUBLIC_DIR = path.join(__dirname, "public");
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
+const AUTH_STORE_PATH = path.join(DATA_DIR, "auth.json");
+const AUDIT_LOG_PATH = path.join(DATA_DIR, "audit.ndjson");
+const SESSION_COOKIE = "resonator_session";
+const SESSION_MAX_AGE_SECONDS = 60 * 60 * 12;
+const scrypt = promisify(scryptCallback);
 let VAULT_DIR = LOCAL_CONFIG.vaultDir || process.env.VAULT_DIR || path.dirname(KNOWLEDGE_DIR);
 let SPACES_ROOT =
   LOCAL_CONFIG.spacesRoot || process.env.SPACES_ROOT || path.join(VAULT_DIR, "knowledge_spaces");
@@ -119,6 +126,12 @@ const MIME_TYPES = {
   ".json": "application/json; charset=utf-8",
 };
 
+const ROLE_LABELS = {
+  admin: "超级管理员",
+  manager: "资料管理员",
+  member: "普通成员",
+};
+
 async function loadEnvFile(envPath) {
   try {
     const content = await readFile(envPath, "utf8");
@@ -157,15 +170,193 @@ async function saveLocalConfig(config) {
   await writeFile(LOCAL_CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
 }
 
+function createEmptyAuthStore() {
+  return {
+    version: 1,
+    sessionSecret: randomBytes(32).toString("hex"),
+    users: [],
+    sessions: [],
+  };
+}
+
+async function loadAuthStore() {
+  await mkdir(DATA_DIR, { recursive: true });
+  try {
+    const store = JSON.parse(await readFile(AUTH_STORE_PATH, "utf8"));
+    return {
+      version: 1,
+      sessionSecret: store.sessionSecret || randomBytes(32).toString("hex"),
+      users: Array.isArray(store.users) ? store.users : [],
+      sessions: Array.isArray(store.sessions) ? store.sessions : [],
+    };
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+    const store = createEmptyAuthStore();
+    await saveAuthStore(store);
+    return store;
+  }
+}
+
+async function saveAuthStore(store) {
+  await mkdir(DATA_DIR, { recursive: true });
+  await writeFile(AUTH_STORE_PATH, JSON.stringify(store, null, 2), "utf8");
+}
+
+let AUTH_STORE = await loadAuthStore();
+
+function normalizeUsername(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function sanitizeUser(user) {
+  if (!user) {
+    return null;
+  }
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: user.displayName,
+    role: user.role,
+    roleLabel: ROLE_LABELS[user.role] || user.role,
+    spaces: Array.isArray(user.spaces) ? user.spaces : [],
+    disabled: Boolean(user.disabled),
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+  };
+}
+
+async function hashPassword(password, salt = randomBytes(16).toString("hex")) {
+  const derived = await scrypt(String(password), salt, 64);
+  return { salt, hash: Buffer.from(derived).toString("hex") };
+}
+
+async function verifyPassword(password, user) {
+  const derived = await scrypt(String(password), user.passwordSalt, 64);
+  const actual = Buffer.from(derived);
+  const expected = Buffer.from(user.passwordHash, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function parseCookies(request) {
+  const cookies = {};
+  for (const item of String(request.headers.cookie || "").split(";")) {
+    const index = item.indexOf("=");
+    if (index < 1) {
+      continue;
+    }
+    cookies[item.slice(0, index).trim()] = decodeURIComponent(item.slice(index + 1).trim());
+  }
+  return cookies;
+}
+
+function signSessionToken(sessionId) {
+  const signature = createHmac("sha256", AUTH_STORE.sessionSecret).update(sessionId).digest("hex");
+  return `${sessionId}.${signature}`;
+}
+
+function readSignedSessionId(token) {
+  const [sessionId, signature] = String(token || "").split(".");
+  if (!sessionId || !signature) {
+    return "";
+  }
+  const expected = createHmac("sha256", AUTH_STORE.sessionSecret).update(sessionId).digest("hex");
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer)
+    ? sessionId
+    : "";
+}
+
+function setSessionCookie(response, token) {
+  response.setHeader(
+    "Set-Cookie",
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MAX_AGE_SECONDS}`
+  );
+}
+
+function clearSessionCookie(response) {
+  response.setHeader(
+    "Set-Cookie",
+    `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`
+  );
+}
+
+async function getRequestUser(request) {
+  const sessionId = readSignedSessionId(parseCookies(request)[SESSION_COOKIE]);
+  if (!sessionId) {
+    return null;
+  }
+  const now = Date.now();
+  const session = AUTH_STORE.sessions.find((item) => item.id === sessionId);
+  if (!session || Date.parse(session.expiresAt) <= now) {
+    return null;
+  }
+  const user = AUTH_STORE.users.find((item) => item.id === session.userId);
+  return user && !user.disabled ? user : null;
+}
+
+function userCanAccessSpace(user, spaceId) {
+  if (!user) {
+    return false;
+  }
+  return user.role === "admin" || (user.spaces || []).includes(normalizeSpaceId(spaceId));
+}
+
+function userCanManageSpace(user, spaceId) {
+  return Boolean(user && (user.role === "admin" || (user.role === "manager" && userCanAccessSpace(user, spaceId))));
+}
+
+function sendForbidden(response, message = "你没有访问这个项目库的权限") {
+  sendJson(response, 403, { error: message });
+}
+
+async function requireUser(request, response) {
+  const user = await getRequestUser(request);
+  if (!user) {
+    sendJson(response, 401, { error: "请先登录", code: "AUTH_REQUIRED" });
+    return null;
+  }
+  return user;
+}
+
+async function appendAuditLog({ request, user, action, space = "", target = "", detail = "" }) {
+  await mkdir(DATA_DIR, { recursive: true });
+  const record = {
+    id: randomUUID(),
+    createdAt: new Date().toISOString(),
+    userId: user?.id || "",
+    username: user?.username || "anonymous",
+    action,
+    space,
+    target,
+    detail,
+    ip: request?.socket?.remoteAddress || "",
+  };
+  await appendFile(AUDIT_LOG_PATH, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+async function readAuditLogs(limit = 100) {
+  try {
+    const content = await readFile(AUDIT_LOG_PATH, "utf8");
+    return content
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .slice(-Math.min(Math.max(Number(limit) || 100, 1), 500))
+      .reverse()
+      .map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+}
+
 function isLocalRequest(request) {
-  const host = String(request.headers.host || "").split(":")[0].toLowerCase();
   const remoteAddress = request.socket.remoteAddress || "";
   return [
-    "localhost",
-    "127.0.0.1",
-    "::1",
-    "::ffff:127.0.0.1",
-  ].includes(host) || [
     "127.0.0.1",
     "::1",
     "::ffff:127.0.0.1",
@@ -846,11 +1037,12 @@ function getChatSessionPath(spaceId, sessionId) {
   return path.join(paths.chatDir, `${normalizeSessionId(sessionId)}.json`);
 }
 
-function createEmptySession(spaceId, title = "新对话") {
+function createEmptySession(spaceId, title = "新对话", ownerId = "") {
   const now = new Date().toISOString();
   return {
     id: createSessionId(),
     space: normalizeSpaceId(spaceId),
+    ownerId,
     title: String(title || "新对话").trim().slice(0, 40) || "新对话",
     createdAt: now,
     updatedAt: now,
@@ -892,7 +1084,7 @@ async function writeChatSession(spaceId, session) {
   return normalizedSession;
 }
 
-async function listChatSessions(spaceId = DEFAULT_SPACE_ID) {
+async function listChatSessions(spaceId = DEFAULT_SPACE_ID, user = null) {
   const paths = await ensureKnowledgeBase(spaceId);
   const entries = await readdir(paths.chatDir, { withFileTypes: true });
   const sessions = [];
@@ -903,6 +1095,9 @@ async function listChatSessions(spaceId = DEFAULT_SPACE_ID) {
     try {
       const content = await readFile(path.join(paths.chatDir, entry.name), "utf8");
       const session = JSON.parse(content);
+      if (user && session.ownerId !== user.id && !(user.role === "admin" && !session.ownerId)) {
+        continue;
+      }
       sessions.push({
         id: normalizeSessionId(session.id || path.basename(entry.name, ".json")),
         title: session.title || "未命名对话",
@@ -925,13 +1120,18 @@ function buildSessionTitle(question) {
 }
 
 async function handleListChatSessions(request, response) {
+  const user = request.authUser;
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  if (!userCanAccessSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
   try {
     sendJson(response, 200, {
       ok: true,
       space,
-      sessions: await listChatSessions(space),
+      sessions: await listChatSessions(space, user),
     });
   } catch (error) {
     sendJson(response, 500, {
@@ -942,13 +1142,22 @@ async function handleListChatSessions(request, response) {
 }
 
 async function handleGetChatSession(request, response) {
+  const user = request.authUser;
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
   const sessionId = normalizeSessionId(requestUrl.searchParams.get("session") || "");
+  if (!userCanAccessSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
   try {
     const session = await readChatSession(space, sessionId);
     if (!session) {
       sendJson(response, 404, { error: "没有找到这个历史对话" });
+      return;
+    }
+    if (session.ownerId !== user.id && !(user.role === "admin" && !session.ownerId)) {
+      sendForbidden(response, "这个历史对话不属于当前账号");
       return;
     }
     sendJson(response, 200, { ok: true, session });
@@ -961,16 +1170,21 @@ async function handleGetChatSession(request, response) {
 }
 
 async function handleCreateChatSession(request, response) {
+  const user = request.authUser;
   const payload = await readRequestJson(request, response);
   if (!payload) {
     return;
   }
 
   const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  if (!userCanAccessSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
   try {
     const session = await writeChatSession(
       space,
-      createEmptySession(space, payload.title || "新对话")
+      createEmptySession(space, payload.title || "新对话", user.id)
     );
     sendJson(response, 200, { ok: true, session });
   } catch (error) {
@@ -1489,6 +1703,7 @@ function buildDraftAnswer(question, results) {
 }
 
 async function handleAsk(request, response) {
+  const user = request.authUser;
   const payload = await readRequestJson(request, response);
   if (!payload) {
     return;
@@ -1501,14 +1716,22 @@ async function handleAsk(request, response) {
     sendJson(response, 400, { error: "请输入问题" });
     return;
   }
+  if (!userCanAccessSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
 
   try {
     let session = requestedSessionId
       ? await readChatSession(space, requestedSessionId)
       : null;
     if (!session) {
-      session = createEmptySession(space, buildSessionTitle(question));
+      session = createEmptySession(space, buildSessionTitle(question), user.id);
+    } else if (session.ownerId !== user.id && !(user.role === "admin" && !session.ownerId)) {
+      sendForbidden(response, "这个历史对话不属于当前账号");
+      return;
     }
+    session.ownerId = user.id;
     if (!session.title || session.title === "新对话") {
       session.title = buildSessionTitle(question);
     }
@@ -1536,6 +1759,7 @@ async function handleAsk(request, response) {
       },
     ].slice(-80);
     session = await writeChatSession(space, session);
+    await appendAuditLog({ request, user, action: "ask", space, target: session.id });
 
     sendJson(response, 200, {
       answer,
@@ -1629,6 +1853,7 @@ function runUpdateScript({ input, project, mode, outputName, dryRun }) {
 }
 
 async function handleUpdateKnowledge(request, response) {
+  const user = request.authUser;
   const payload = await readRequestJson(request, response);
   if (!payload) {
     return;
@@ -1639,6 +1864,12 @@ async function handleUpdateKnowledge(request, response) {
   const mode = String(payload.mode || "mixed").trim();
   const outputName = String(payload.outputName || "").trim();
   const dryRun = Boolean(payload.dryRun);
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+
+  if (user?.role !== "admin" || !isLocalRequest(request)) {
+    sendForbidden(response, "旧版路径更新功能仅限部署电脑本机的超级管理员");
+    return;
+  }
 
   if (!project || !input) {
     sendJson(response, 400, { error: "项目名称和资料路径不能为空" });
@@ -2108,6 +2339,7 @@ async function createImportJob({ space, project, mode, outputName, saved }) {
 }
 
 async function handleImportKnowledge(request, response) {
+  const user = request.authUser;
   try {
     const bodyBuffer = await readRequestBuffer(request);
     const { fields, files } = parseMultipartForm(request, bodyBuffer);
@@ -2116,6 +2348,11 @@ async function handleImportKnowledge(request, response) {
     const mode = String(fields.mode || "mixed").trim();
     const outputName = String(fields.outputName || "").trim();
     const dryRun = fields.dryRun === "true";
+
+    if (!userCanManageSpace(user, space)) {
+      sendForbidden(response, "只有项目资料管理员可以上传并整理资料");
+      return;
+    }
 
     if (!project) {
       sendJson(response, 400, { error: "项目名称不能为空" });
@@ -2176,6 +2413,7 @@ async function handleImportKnowledge(request, response) {
         uploadDir: saved.uploadDir,
         savedFiles: saved.savedFiles,
       };
+      await appendAuditLog({ request, user, action: "import", space, target: job.id, detail: `${project} / ${files.length} 个文件` });
     }
 
     sendJson(response, 200, {
@@ -2200,6 +2438,7 @@ async function handleImportKnowledge(request, response) {
 }
 
 async function handleImportPrecheck(request, response) {
+  const user = request.authUser;
   const payload = await readRequestJson(request, response);
   if (!payload) {
     return;
@@ -2209,6 +2448,11 @@ async function handleImportPrecheck(request, response) {
   const project = String(payload.project || "未命名项目").trim();
   const mode = String(payload.mode || "mixed").trim();
   const files = Array.isArray(payload.files) ? payload.files : [];
+
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response, "只有项目资料管理员可以检查待上传资料");
+    return;
+  }
 
   try {
     if (!project) {
@@ -2259,6 +2503,7 @@ async function handleImportPrecheck(request, response) {
 }
 
 async function handleCreateSpace(request, response) {
+  const user = request.authUser;
   const payload = await readRequestJson(request, response);
   if (!payload) {
     return;
@@ -2271,8 +2516,19 @@ async function handleCreateSpace(request, response) {
   }
   const name = normalizeSpaceId(rawName);
 
+  if (!user || !["admin", "manager"].includes(user.role)) {
+    sendForbidden(response, "只有管理员可以创建项目库");
+    return;
+  }
+
   try {
     const paths = await ensureKnowledgeBase(name);
+    if (user.role === "manager" && !user.spaces.includes(name)) {
+      user.spaces.push(name);
+      user.updatedAt = new Date().toISOString();
+      await saveAuthStore(AUTH_STORE);
+    }
+    await appendAuditLog({ request, user, action: "space.create", space: name, target: paths.root });
     sendJson(response, 200, {
       ok: true,
       space: {
@@ -2280,7 +2536,7 @@ async function handleCreateSpace(request, response) {
         name,
         root: paths.root,
       },
-      spaces: await listSpaces(),
+      spaces: getAccessibleSpaces(user, await listSpaces()),
     });
   } catch (error) {
     sendJson(response, 500, {
@@ -2291,7 +2547,12 @@ async function handleCreateSpace(request, response) {
 }
 
 async function handleListImportJobs(requestUrl, response) {
+  const user = response.authUser;
   const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
   const limit = Number(requestUrl.searchParams.get("limit") || 30);
   try {
     sendJson(response, 200, {
@@ -2308,7 +2569,12 @@ async function handleListImportJobs(requestUrl, response) {
 }
 
 async function handleGetImportJob(requestUrl, response) {
+  const user = response.authUser;
   const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
   const jobId = decodeURIComponent(requestUrl.pathname.split("/").pop() || "");
   if (!jobId) {
     sendJson(response, 400, { error: "任务编号不能为空" });
@@ -2332,7 +2598,12 @@ async function handleGetImportJob(requestUrl, response) {
 }
 
 async function handleListManagedFiles(requestUrl, response) {
+  const user = response.authUser;
   const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
   const type = requestUrl.searchParams.get("type") || "all";
   const query = requestUrl.searchParams.get("q") || "";
   try {
@@ -2350,12 +2621,17 @@ async function handleListManagedFiles(requestUrl, response) {
 }
 
 async function handleDeleteManagedFile(request, response) {
+  const user = request.authUser;
   const payload = await readRequestJson(request, response);
   if (!payload) {
     return;
   }
   const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
   const relativePath = String(payload.relativePath || "").trim();
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response, "只有项目资料管理员可以删除资料");
+    return;
+  }
   if (!relativePath) {
     sendJson(response, 400, { error: "文件路径不能为空" });
     return;
@@ -2363,6 +2639,7 @@ async function handleDeleteManagedFile(request, response) {
 
   try {
     const deleted = await deleteManagedFile(space, relativePath);
+    await appendAuditLog({ request, user, action: "file.delete", space, target: relativePath });
     sendJson(response, 200, {
       ok: true,
       space,
@@ -2377,6 +2654,11 @@ async function handleDeleteManagedFile(request, response) {
 }
 
 async function handleVaultConfig(request, response) {
+  const user = request.authUser;
+  if (user?.role !== "admin") {
+    sendForbidden(response, "只有超级管理员可以修改知识库路径");
+    return;
+  }
   if (!isLocalRequest(request)) {
     sendJson(response, 403, { error: "只有部署电脑本机可以修改知识库路径" });
     return;
@@ -2414,12 +2696,215 @@ async function handleVaultConfig(request, response) {
   }
 }
 
+function getAccessibleSpaces(user, spaces) {
+  if (user.role === "admin") {
+    return spaces;
+  }
+  const allowed = new Set(user.spaces || []);
+  return spaces.filter((space) => allowed.has(space.id));
+}
+
+async function createLoginSession(userId) {
+  const now = Date.now();
+  AUTH_STORE.sessions = AUTH_STORE.sessions.filter((session) => Date.parse(session.expiresAt) > now);
+  const session = {
+    id: randomBytes(32).toString("hex"),
+    userId,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + SESSION_MAX_AGE_SECONDS * 1000).toISOString(),
+  };
+  AUTH_STORE.sessions.push(session);
+  await saveAuthStore(AUTH_STORE);
+  return signSessionToken(session.id);
+}
+
+async function handleAuthStatus(request, response) {
+  const user = await getRequestUser(request);
+  sendJson(response, 200, {
+    ok: true,
+    initialized: AUTH_STORE.users.length > 0,
+    authenticated: Boolean(user),
+    user: sanitizeUser(user),
+  });
+}
+
+async function handleAuthSetup(request, response) {
+  if (AUTH_STORE.users.length > 0) {
+    sendJson(response, 409, { error: "系统已经完成管理员初始化" });
+    return;
+  }
+  if (!isLocalRequest(request)) {
+    sendJson(response, 403, { error: "首次管理员只能在部署电脑本机创建" });
+    return;
+  }
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+  const username = normalizeUsername(payload.username);
+  const displayName = String(payload.displayName || payload.username || "管理员").trim().slice(0, 40);
+  const password = String(payload.password || "");
+  if (!/^[a-z0-9_.-]{3,32}$/.test(username)) {
+    sendJson(response, 400, { error: "账号需为 3-32 位字母、数字、点、横线或下划线" });
+    return;
+  }
+  if (password.length < 8) {
+    sendJson(response, 400, { error: "密码至少需要 8 位" });
+    return;
+  }
+  const passwordData = await hashPassword(password);
+  const now = new Date().toISOString();
+  const user = {
+    id: randomUUID(),
+    username,
+    displayName,
+    role: "admin",
+    spaces: [],
+    disabled: false,
+    passwordSalt: passwordData.salt,
+    passwordHash: passwordData.hash,
+    createdAt: now,
+    updatedAt: now,
+  };
+  AUTH_STORE.users.push(user);
+  await saveAuthStore(AUTH_STORE);
+  setSessionCookie(response, await createLoginSession(user.id));
+  await appendAuditLog({ request, user, action: "auth.setup", target: user.username });
+  sendJson(response, 200, { ok: true, user: sanitizeUser(user) });
+}
+
+async function handleLogin(request, response) {
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+  const username = normalizeUsername(payload.username);
+  const password = String(payload.password || "");
+  const user = AUTH_STORE.users.find((item) => item.username === username);
+  if (!user || user.disabled || !(await verifyPassword(password, user))) {
+    await appendAuditLog({ request, user: null, action: "auth.login.failed", target: username });
+    sendJson(response, 401, { error: "账号或密码不正确" });
+    return;
+  }
+  setSessionCookie(response, await createLoginSession(user.id));
+  await appendAuditLog({ request, user, action: "auth.login", target: user.username });
+  sendJson(response, 200, { ok: true, user: sanitizeUser(user) });
+}
+
+async function handleLogout(request, response) {
+  const token = parseCookies(request)[SESSION_COOKIE];
+  const sessionId = readSignedSessionId(token);
+  const user = await getRequestUser(request);
+  if (sessionId) {
+    AUTH_STORE.sessions = AUTH_STORE.sessions.filter((session) => session.id !== sessionId);
+    await saveAuthStore(AUTH_STORE);
+  }
+  clearSessionCookie(response);
+  await appendAuditLog({ request, user, action: "auth.logout", target: user?.username || "" });
+  sendJson(response, 200, { ok: true });
+}
+
+async function handleListUsers(request, response) {
+  if (request.authUser?.role !== "admin") {
+    sendForbidden(response, "只有超级管理员可以管理账号");
+    return;
+  }
+  sendJson(response, 200, { ok: true, users: AUTH_STORE.users.map(sanitizeUser) });
+}
+
+async function handleSaveUser(request, response) {
+  const actor = request.authUser;
+  if (actor?.role !== "admin") {
+    sendForbidden(response, "只有超级管理员可以管理账号");
+    return;
+  }
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+  const username = normalizeUsername(payload.username);
+  const displayName = String(payload.displayName || payload.username || "").trim().slice(0, 40);
+  const password = String(payload.password || "");
+  const role = ["admin", "manager", "member"].includes(payload.role) ? payload.role : "member";
+  const availableSpaces = new Set((await listSpaces()).map((space) => space.id));
+  const spaces = Array.from(new Set((Array.isArray(payload.spaces) ? payload.spaces : [])
+    .map(normalizeSpaceId)
+    .filter((space) => availableSpaces.has(space))));
+  if (!/^[a-z0-9_.-]{3,32}$/.test(username)) {
+    sendJson(response, 400, { error: "账号需为 3-32 位字母、数字、点、横线或下划线" });
+    return;
+  }
+  let user = payload.id ? AUTH_STORE.users.find((item) => item.id === payload.id) : null;
+  if (AUTH_STORE.users.some((item) => item.username === username && item.id !== user?.id)) {
+    sendJson(response, 409, { error: "这个账号已经存在" });
+    return;
+  }
+  if (!user && password.length < 8) {
+    sendJson(response, 400, { error: "新账号密码至少需要 8 位" });
+    return;
+  }
+  if (password && password.length < 8) {
+    sendJson(response, 400, { error: "密码至少需要 8 位" });
+    return;
+  }
+  const now = new Date().toISOString();
+  if (!user) {
+    user = {
+      id: randomUUID(),
+      username,
+      displayName,
+      role,
+      spaces,
+      disabled: Boolean(payload.disabled),
+      createdAt: now,
+      updatedAt: now,
+    };
+    AUTH_STORE.users.push(user);
+  } else {
+    if (user.id === actor.id && (role !== "admin" || payload.disabled)) {
+      sendJson(response, 400, { error: "不能停用自己的账号或取消自己的超级管理员身份" });
+      return;
+    }
+    const activeAdmins = AUTH_STORE.users.filter((item) => item.role === "admin" && !item.disabled);
+    if (user.role === "admin" && activeAdmins.length === 1 && (role !== "admin" || payload.disabled)) {
+      sendJson(response, 400, { error: "系统必须至少保留一个可用的超级管理员" });
+      return;
+    }
+    Object.assign(user, { username, displayName, role, spaces, disabled: Boolean(payload.disabled), updatedAt: now });
+  }
+  if (password) {
+    const passwordData = await hashPassword(password);
+    user.passwordSalt = passwordData.salt;
+    user.passwordHash = passwordData.hash;
+    AUTH_STORE.sessions = AUTH_STORE.sessions.filter((session) => session.userId !== user.id || user.id === actor.id);
+  }
+  await saveAuthStore(AUTH_STORE);
+  await appendAuditLog({ request, user: actor, action: payload.id ? "user.update" : "user.create", target: user.username, detail: `${role} / ${spaces.join(", ")}` });
+  sendJson(response, 200, { ok: true, user: sanitizeUser(user), users: AUTH_STORE.users.map(sanitizeUser) });
+}
+
+async function handleAuditLogs(request, response, requestUrl) {
+  const user = request.authUser;
+  if (!user || !["admin", "manager"].includes(user.role)) {
+    sendForbidden(response, "只有管理员可以查看操作日志");
+    return;
+  }
+  let logs = await readAuditLogs(requestUrl.searchParams.get("limit") || 100);
+  if (user.role === "manager") {
+    const allowed = new Set(user.spaces || []);
+    logs = logs.filter((item) => !item.space || allowed.has(item.space));
+  }
+  sendJson(response, 200, { ok: true, logs });
+}
+
 async function serveStatic(request, response) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const routeMap = {
     "/": "/index.html",
     "/admin": "/admin.html",
     "/admin/": "/admin.html",
+    "/login": "/login.html",
+    "/login/": "/login.html",
   };
   const safePath = routeMap[requestUrl.pathname] || requestUrl.pathname;
   const filePath = path.normalize(path.join(PUBLIC_DIR, safePath));
@@ -2445,6 +2930,49 @@ async function serveStatic(request, response) {
 
 const server = createServer(async (request, response) => {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+
+  if (request.method === "GET" && ["/", "/admin", "/admin/"].includes(requestUrl.pathname)) {
+    const pageUser = await getRequestUser(request);
+    if (!pageUser) {
+      response.writeHead(302, { Location: "/login" });
+      response.end();
+      return;
+    }
+    if (["/admin", "/admin/"].includes(requestUrl.pathname) && pageUser.role === "member") {
+      response.writeHead(302, { Location: "/" });
+      response.end();
+      return;
+    }
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/auth/status") {
+    await handleAuthStatus(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/auth/setup") {
+    await handleAuthSetup(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/auth/login") {
+    await handleLogin(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/auth/logout") {
+    await handleLogout(request, response);
+    return;
+  }
+
+  if (requestUrl.pathname.startsWith("/api/")) {
+    const user = await requireUser(request, response);
+    if (!user) {
+      return;
+    }
+    request.authUser = user;
+    response.authUser = user;
+  }
 
   if (request.method === "POST" && requestUrl.pathname === "/api/ask") {
     await handleAsk(request, response);
@@ -2502,11 +3030,14 @@ const server = createServer(async (request, response) => {
   }
 
   if (request.method === "GET" && requestUrl.pathname === "/api/spaces") {
+    const spaces = getAccessibleSpaces(request.authUser, await listSpaces());
     sendJson(response, 200, {
       ok: true,
-      defaultSpace: DEFAULT_SPACE_ID,
+      defaultSpace: spaces.some((space) => space.id === DEFAULT_SPACE_ID)
+        ? DEFAULT_SPACE_ID
+        : spaces[0]?.id || "",
       spacesRoot: SPACES_ROOT,
-      spaces: await listSpaces(),
+      spaces,
     });
     return;
   }
@@ -2518,12 +3049,17 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "GET" && requestUrl.pathname === "/api/kb-status") {
     try {
-      const status = await getKnowledgeBaseStatus(
-        requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID
-      );
+      const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+      if (!userCanAccessSpace(request.authUser, space)) {
+        sendForbidden(response);
+        return;
+      }
+      const status = await getKnowledgeBaseStatus(space);
       sendJson(response, 200, {
         ...status,
-        canConfigureVault: isLocalRequest(request),
+        canConfigureVault: request.authUser.role === "admin" && isLocalRequest(request),
+        canManage: userCanManageSpace(request.authUser, space),
+        user: sanitizeUser(request.authUser),
       });
     } catch (error) {
       sendJson(response, 500, {
@@ -2540,9 +3076,29 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "GET" && requestUrl.pathname === "/api/users") {
+    await handleListUsers(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/users") {
+    await handleSaveUser(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/audit-logs") {
+    await handleAuditLogs(request, response, requestUrl);
+    return;
+  }
+
   if (request.method === "GET" && requestUrl.pathname === "/api/health") {
+    const requestedSpace = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+    if (!userCanAccessSpace(request.authUser, requestedSpace)) {
+      sendForbidden(response);
+      return;
+    }
     const status = await getKnowledgeBaseStatus(
-      requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID
+      requestedSpace
     );
     sendJson(response, 200, {
       ok: true,

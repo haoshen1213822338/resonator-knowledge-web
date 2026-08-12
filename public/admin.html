@@ -30,6 +30,14 @@
           <a class="primary-button link-button" href="/">返回问答页</a>
           <button type="button" class="ghost-button" id="refresh-status">刷新状态</button>
         </nav>
+
+        <section class="account-panel">
+          <div>
+            <strong id="current-user-name">正在读取账号</strong>
+            <span id="current-user-role">-</span>
+          </div>
+          <button type="button" class="icon-text-button" id="logout-button">退出</button>
+        </section>
       </aside>
 
       <section class="admin-workspace" aria-labelledby="admin-title">
@@ -194,6 +202,60 @@
             <div class="status-footer">
               <span id="kb-path">正在读取本地知识库路径。</span>
             </div>
+          </article>
+
+          <article class="admin-card access-card hidden" id="access-card" aria-labelledby="access-title">
+            <div class="section-label" id="access-title">账号与项目权限</div>
+            <div class="access-layout">
+              <form id="user-form" class="user-form">
+                <input id="user-id" type="hidden" />
+                <label>
+                  <span>登录账号</span>
+                  <input id="user-username" autocomplete="off" placeholder="例如：zhangsan" required />
+                </label>
+                <label>
+                  <span>姓名</span>
+                  <input id="user-display-name" placeholder="例如：张三" required />
+                </label>
+                <label>
+                  <span>角色</span>
+                  <select id="user-role">
+                    <option value="member">普通成员</option>
+                    <option value="manager">资料管理员</option>
+                    <option value="admin">超级管理员</option>
+                  </select>
+                </label>
+                <label>
+                  <span>密码</span>
+                  <input id="user-password" type="password" autocomplete="new-password" placeholder="新账号必填，修改时可留空" />
+                </label>
+                <fieldset class="space-permissions">
+                  <legend>允许访问的项目库</legend>
+                  <div id="user-space-options" class="checkbox-list"></div>
+                </fieldset>
+                <label class="inline-check">
+                  <input id="user-disabled" type="checkbox" />
+                  <span>停用这个账号</span>
+                </label>
+                <div class="update-actions">
+                  <button type="button" class="ghost-button compact-button" id="reset-user-form">清空</button>
+                  <button type="submit" class="primary-button compact-button">保存账号</button>
+                </div>
+                <p id="user-message" class="space-message">新账号密码至少 8 位。</p>
+              </form>
+              <div id="user-list" class="user-list empty">正在读取账号。</div>
+            </div>
+          </article>
+
+          <article class="admin-card audit-card hidden" id="audit-card" aria-labelledby="audit-title">
+            <div class="file-manager-head">
+              <div>
+                <div class="section-label" id="audit-title">操作日志</div>
+                <p class="file-manager-summary">记录登录、问答、上传、建库和删除操作。</p>
+              </div>
+              <button type="button" class="ghost-button compact-button" id="refresh-audit">刷新</button>
+            </div>
+            <div id="audit-list" class="audit-list empty">正在读取操作日志。</div>
           </article>
         </section>
       </section>

@@ -50,12 +50,33 @@ const importPanel = document.querySelector("#import-panel");
 const managePanel = document.querySelector("#manage-panel");
 const toggleImportPanel = document.querySelector("#toggle-import-panel");
 const toggleManagePanel = document.querySelector("#toggle-manage-panel");
+const currentUserName = document.querySelector("#current-user-name");
+const currentUserRole = document.querySelector("#current-user-role");
+const logoutButton = document.querySelector("#logout-button");
+const adminLink = document.querySelector("#admin-link");
+const accessCard = document.querySelector("#access-card");
+const userForm = document.querySelector("#user-form");
+const userId = document.querySelector("#user-id");
+const userUsername = document.querySelector("#user-username");
+const userDisplayName = document.querySelector("#user-display-name");
+const userRole = document.querySelector("#user-role");
+const userPassword = document.querySelector("#user-password");
+const userDisabled = document.querySelector("#user-disabled");
+const userSpaceOptions = document.querySelector("#user-space-options");
+const userList = document.querySelector("#user-list");
+const userMessage = document.querySelector("#user-message");
+const resetUserFormButton = document.querySelector("#reset-user-form");
+const auditCard = document.querySelector("#audit-card");
+const auditList = document.querySelector("#audit-list");
+const refreshAudit = document.querySelector("#refresh-audit");
 
 const root = document.documentElement;
 let currentSessionId = localStorage.getItem("currentChatSessionId") || "";
 let currentMessages = [];
 const activeImportPolls = new Map();
 let managedFileCount = 0;
+let currentUser = null;
+let availableSpaces = [];
 const pointer = {
   x: window.innerWidth / 2,
   y: window.innerHeight * 0.35,
@@ -235,6 +256,181 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+async function apiFetch(url, options = {}) {
+  const response = await fetch(url, options);
+  if (response.status === 401) {
+    window.location.replace("/login");
+    throw new Error("请先登录");
+  }
+  return response;
+}
+
+async function loadCurrentUser() {
+  const response = await fetch("/api/auth/status");
+  const payload = await response.json();
+  if (!payload.authenticated) {
+    window.location.replace("/login");
+    throw new Error("请先登录");
+  }
+  currentUser = payload.user;
+  if (currentUserName) {
+    currentUserName.textContent = currentUser.displayName || currentUser.username;
+  }
+  if (currentUserRole) {
+    currentUserRole.textContent = currentUser.roleLabel;
+  }
+  const canManage = ["admin", "manager"].includes(currentUser.role);
+  adminLink?.classList.toggle("hidden", !canManage);
+  document.body.dataset.role = currentUser.role;
+  return currentUser;
+}
+
+async function logout() {
+  await fetch("/api/auth/logout", { method: "POST" });
+  localStorage.removeItem("currentChatSessionId");
+  window.location.replace("/login");
+}
+
+function setUserMessage(message, type = "") {
+  if (!userMessage) {
+    return;
+  }
+  userMessage.className = type ? `space-message ${type}` : "space-message";
+  userMessage.textContent = message;
+}
+
+function renderUserSpaceOptions(selected = []) {
+  if (!userSpaceOptions) {
+    return;
+  }
+  const selectedSet = new Set(selected);
+  userSpaceOptions.innerHTML = availableSpaces.map((space) => `
+    <label class="permission-option">
+      <input type="checkbox" value="${escapeHtml(space.id)}" ${selectedSet.has(space.id) ? "checked" : ""} />
+      <span>${escapeHtml(space.name)}</span>
+    </label>
+  `).join("");
+}
+
+function resetUserForm() {
+  if (!userForm) {
+    return;
+  }
+  userForm.reset();
+  userId.value = "";
+  userRole.value = "member";
+  renderUserSpaceOptions([]);
+  setUserMessage("新账号密码至少 8 位。");
+}
+
+function renderUsers(users = []) {
+  if (!userList) {
+    return;
+  }
+  userList.className = "user-list";
+  userList.innerHTML = users.map((user) => `
+    <button type="button" class="user-row" data-user-id="${escapeHtml(user.id)}"
+      data-user="${encodeURIComponent(JSON.stringify(user))}">
+      <span class="user-avatar">${escapeHtml((user.displayName || user.username).slice(0, 1).toUpperCase())}</span>
+      <span class="user-row-copy">
+        <strong>${escapeHtml(user.displayName || user.username)}</strong>
+        <small>${escapeHtml(user.username)} · ${escapeHtml(user.roleLabel)}${user.disabled ? " · 已停用" : ""}</small>
+        <em>${user.role === "admin" ? "全部项目" : `${user.spaces.length} 个项目`}</em>
+      </span>
+    </button>
+  `).join("");
+}
+
+async function loadUsers() {
+  if (!accessCard || currentUser?.role !== "admin") {
+    return;
+  }
+  accessCard.classList.remove("hidden");
+  const response = await apiFetch("/api/users");
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "账号读取失败");
+  }
+  renderUsers(payload.users || []);
+  renderUserSpaceOptions([]);
+}
+
+async function saveUser(event) {
+  event.preventDefault();
+  const spaces = Array.from(userSpaceOptions.querySelectorAll("input:checked")).map((input) => input.value);
+  const response = await apiFetch("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: userId.value,
+      username: userUsername.value.trim(),
+      displayName: userDisplayName.value.trim(),
+      role: userRole.value,
+      password: userPassword.value,
+      spaces,
+      disabled: userDisabled.checked,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    setUserMessage(payload.error || "账号保存失败", "error");
+    return;
+  }
+  renderUsers(payload.users || []);
+  resetUserForm();
+  setUserMessage("账号和项目权限已保存。", "success");
+  await loadAuditLogs();
+}
+
+function editUser(button) {
+  const user = JSON.parse(decodeURIComponent(button.dataset.user));
+  userId.value = user.id;
+  userUsername.value = user.username;
+  userDisplayName.value = user.displayName;
+  userRole.value = user.role;
+  userPassword.value = "";
+  userDisabled.checked = user.disabled;
+  renderUserSpaceOptions(user.spaces || []);
+  setUserMessage(`正在编辑：${user.displayName || user.username}`);
+  userUsername.focus();
+}
+
+function getAuditActionLabel(action) {
+  return {
+    "auth.setup": "初始化管理员",
+    "auth.login": "登录",
+    "auth.login.failed": "登录失败",
+    "auth.logout": "退出",
+    ask: "知识问答",
+    import: "资料入库",
+    "space.create": "新建项目库",
+    "file.delete": "删除资料",
+    "user.create": "创建账号",
+    "user.update": "修改账号",
+  }[action] || action;
+}
+
+async function loadAuditLogs() {
+  if (!auditCard || !["admin", "manager"].includes(currentUser?.role)) {
+    return;
+  }
+  auditCard.classList.remove("hidden");
+  const response = await apiFetch("/api/audit-logs?limit=100");
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "日志读取失败");
+  }
+  const logs = payload.logs || [];
+  auditList.className = logs.length ? "audit-list" : "audit-list empty";
+  auditList.innerHTML = logs.length ? logs.map((item) => `
+    <div class="audit-row">
+      <span>${escapeHtml(getAuditActionLabel(item.action))}</span>
+      <strong>${escapeHtml(item.username || "未登录用户")}</strong>
+      <small>${escapeHtml(item.space || item.target || "全局")} · ${new Date(item.createdAt).toLocaleString("zh-CN")}</small>
+    </div>
+  `).join("") : "暂无操作日志。";
 }
 
 function updatePointer(event) {
@@ -512,13 +708,19 @@ function renderSpaces(spaces, selectedSpace) {
 }
 
 async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledgeSpace")) {
-  const response = await fetch("/api/spaces");
+  const response = await apiFetch("/api/spaces");
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.detail || payload.error || "项目库列表读取失败");
   }
 
   const spaces = payload.spaces || [];
+  availableSpaces = spaces;
+  if (!spaces.length) {
+    renderSpaces([], "");
+    setSpaceMessage("当前账号还没有被分配项目库，请联系管理员。", "error");
+    return;
+  }
   const selected = spaces.some((space) => space.id === preferredSpace)
     ? preferredSpace
     : payload.defaultSpace || spaces[0]?.id || "";
@@ -544,7 +746,7 @@ async function createKnowledgeSpace() {
   createSpace.disabled = true;
   setSpaceMessage("正在创建项目库...");
   try {
-    const response = await fetch("/api/spaces", {
+    const response = await apiFetch("/api/spaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
@@ -569,7 +771,7 @@ async function createKnowledgeSpace() {
 }
 
 async function createSpaceByName(name) {
-  const response = await fetch("/api/spaces", {
+  const response = await apiFetch("/api/spaces", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
@@ -611,7 +813,7 @@ function resetCurrentChat() {
 }
 
 async function loadChatSessions() {
-  const response = await fetch(`/api/chat-sessions?space=${encodeURIComponent(getCurrentSpace())}`);
+  const response = await apiFetch(`/api/chat-sessions?space=${encodeURIComponent(getCurrentSpace())}`);
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.detail || payload.error || "历史对话读取失败");
@@ -625,7 +827,7 @@ async function loadChatSession(sessionId) {
     resetCurrentChat();
     return;
   }
-  const response = await fetch(
+  const response = await apiFetch(
     `/api/chat-session?space=${encodeURIComponent(getCurrentSpace())}&session=${encodeURIComponent(sessionId)}`
   );
   const payload = await response.json();
@@ -696,7 +898,7 @@ async function initializeVaultPath() {
   initVault.disabled = true;
   setVaultMessage("正在初始化本地知识库路径...");
   try {
-    const response = await fetch("/api/vault-config", {
+    const response = await apiFetch("/api/vault-config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ vaultDir: nextPath }),
@@ -757,7 +959,7 @@ async function loadKnowledgeStatus() {
       apiState.textContent = "检查中";
     }
     const space = getCurrentSpace();
-    const response = await fetch(`/api/kb-status?space=${encodeURIComponent(space)}`);
+    const response = await apiFetch(`/api/kb-status?space=${encodeURIComponent(space)}`);
     const status = await response.json();
     if (!response.ok) {
       throw new Error(status.detail || status.error || "状态检查失败");
@@ -843,7 +1045,7 @@ async function loadImportJobs() {
   if (!importJobsBox) {
     return [];
   }
-  const response = await fetch(
+  const response = await apiFetch(
     `/api/import-jobs?space=${encodeURIComponent(getCurrentSpace())}&limit=20`
   );
   const payload = await response.json();
@@ -909,7 +1111,7 @@ async function loadManagedFiles() {
   fileList.textContent = "正在读取资料列表。";
   const type = fileFilterType?.value || "all";
   const query = fileSearch?.value?.trim() || "";
-  const response = await fetch(
+  const response = await apiFetch(
     `/api/files?space=${encodeURIComponent(getCurrentSpace())}&type=${encodeURIComponent(type)}&q=${encodeURIComponent(query)}`
   );
   const payload = await response.json();
@@ -952,7 +1154,7 @@ async function deleteManagedFile(relativePath) {
     return;
   }
 
-  const response = await fetch("/api/files", {
+  const response = await apiFetch("/api/files", {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -975,7 +1177,7 @@ async function pollImportJob(jobId) {
 
   const poll = async () => {
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `/api/import-jobs/${encodeURIComponent(jobId)}?space=${encodeURIComponent(getCurrentSpace())}`
       );
       const payload = await response.json();
@@ -1095,7 +1297,7 @@ function sendImportRequest(formData, { dryRun, hasVideo }) {
 
 async function sendPrecheckRequest({ targetSpace, project, mode, files }) {
   setUploadProgress(35, "正在检查文件信息");
-  const response = await fetch("/api/import-precheck", {
+  const response = await apiFetch("/api/import-precheck", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1257,6 +1459,16 @@ kbTargetSpace?.addEventListener("change", async () => {
 });
 kbSpaceAction?.addEventListener("change", syncImportMode);
 createSpace?.addEventListener("click", createKnowledgeSpace);
+logoutButton?.addEventListener("click", logout);
+userForm?.addEventListener("submit", saveUser);
+resetUserFormButton?.addEventListener("click", resetUserForm);
+userList?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-user-id]");
+  if (button) {
+    editUser(button);
+  }
+});
+refreshAudit?.addEventListener("click", loadAuditLogs);
 initVault?.addEventListener("click", initializeVaultPath);
 refreshStatus?.addEventListener("click", async () => {
   await loadKnowledgeStatus();
@@ -1313,10 +1525,13 @@ kbDryRun?.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate?.addEventListener("click", () => runKnowledgeUpdate(false));
 syncImportMode();
 applyFileManagerCollapsed(isFileManagerCollapsed());
-loadSpaces()
+loadCurrentUser()
+  .then(loadSpaces)
   .then(loadKnowledgeStatus)
   .then(loadImportJobs)
   .then(loadManagedFiles)
+  .then(loadUsers)
+  .then(loadAuditLogs)
   .then(() => {
     if (chatSessionsBox) {
       return initializeChatHistory();
@@ -1349,7 +1564,7 @@ form?.addEventListener("submit", async (event) => {
   questionInput.value = "";
 
   try {
-    const response = await fetch("/api/ask", {
+    const response = await apiFetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

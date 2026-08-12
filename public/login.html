@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>登录 · 共振体知识平台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="auth-page">
+    <canvas class="resonance-canvas" id="resonance-canvas" aria-hidden="true"></canvas>
+    <main class="auth-shell">
+      <section class="auth-brand">
+        <header class="site-brand" aria-label="共振体 Resonator">
+          <div class="brand-wordmark">
+            <span class="brand-cn">共振体</span>
+            <span class="brand-divider"></span>
+            <span class="brand-en">RESONATOR</span>
+          </div>
+          <span class="brand-tag">KNOWLEDGE SYSTEM</span>
+        </header>
+        <div class="auth-statement">
+          <p class="eyebrow">COMPANY INTELLIGENCE</p>
+          <h1>让公司的经验，<br />成为每个人的工作能力。</h1>
+          <p>资料按项目隔离，回答保留来源，所有访问均经过身份验证。</p>
+        </div>
+      </section>
+      <section class="auth-card">
+        <div>
+          <p class="eyebrow" id="auth-eyebrow">安全登录</p>
+          <h2 id="auth-title">进入知识平台</h2>
+          <p class="auth-description" id="auth-description">使用公司分配的账号登录。</p>
+        </div>
+        <form id="auth-form" class="auth-form">
+          <label class="setup-only hidden">
+            <span>管理员姓名</span>
+            <input id="display-name" autocomplete="name" placeholder="你的姓名" />
+          </label>
+          <label>
+            <span>账号</span>
+            <input id="username" autocomplete="username" placeholder="输入账号" required />
+          </label>
+          <label>
+            <span>密码</span>
+            <input id="password" type="password" autocomplete="current-password" placeholder="输入密码" required />
+          </label>
+          <button type="submit" class="primary-button" id="auth-submit">登录</button>
+          <p id="auth-message" class="auth-message"></p>
+        </form>
+      </section>
+    </main>
+    <script src="/login.js" type="module"></script>
+  </body>
+</html>
