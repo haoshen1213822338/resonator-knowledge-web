@@ -30,9 +30,13 @@
           <h2 id="auth-title">进入知识平台</h2>
           <p class="auth-description" id="auth-description">使用公司分配的账号登录。</p>
         </div>
+        <div class="auth-switch hidden" id="auth-switch" role="tablist" aria-label="账号入口">
+          <button type="button" class="active" id="login-tab" role="tab" aria-selected="true">登录</button>
+          <button type="button" id="register-tab" role="tab" aria-selected="false">注册</button>
+        </div>
         <form id="auth-form" class="auth-form">
-          <label class="setup-only hidden">
-            <span>管理员姓名</span>
+          <label class="name-field hidden">
+            <span id="name-label">姓名</span>
             <input id="display-name" autocomplete="name" placeholder="你的姓名" />
           </label>
           <label>

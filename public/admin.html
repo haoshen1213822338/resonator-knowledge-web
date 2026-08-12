@@ -211,23 +211,18 @@
                 <input id="user-id" type="hidden" />
                 <label>
                   <span>登录账号</span>
-                  <input id="user-username" autocomplete="off" placeholder="例如：zhangsan" required />
+                  <input id="user-username" readonly placeholder="员工注册后显示" />
                 </label>
                 <label>
                   <span>姓名</span>
-                  <input id="user-display-name" placeholder="例如：张三" required />
+                  <input id="user-display-name" readonly placeholder="员工注册后显示" />
                 </label>
                 <label>
                   <span>角色</span>
                   <select id="user-role">
                     <option value="member">普通成员</option>
                     <option value="manager">资料管理员</option>
-                    <option value="admin">超级管理员</option>
                   </select>
-                </label>
-                <label>
-                  <span>密码</span>
-                  <input id="user-password" type="password" autocomplete="new-password" placeholder="新账号必填，修改时可留空" />
                 </label>
                 <fieldset class="space-permissions">
                   <legend>允许访问的项目库</legend>
@@ -238,10 +233,10 @@
                   <span>停用这个账号</span>
                 </label>
                 <div class="update-actions">
-                  <button type="button" class="ghost-button compact-button" id="reset-user-form">清空</button>
-                  <button type="submit" class="primary-button compact-button">保存账号</button>
+                  <button type="button" class="ghost-button compact-button" id="reset-user-form">取消编辑</button>
+                  <button type="submit" class="primary-button compact-button">保存权限</button>
                 </div>
-                <p id="user-message" class="space-message">新账号密码至少 8 位。</p>
+                <p id="user-message" class="space-message">员工可自行注册；这里用于分配角色和项目权限。</p>
               </form>
               <div id="user-list" class="user-list empty">正在读取账号。</div>
             </div>

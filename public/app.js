@@ -60,7 +60,6 @@ const userId = document.querySelector("#user-id");
 const userUsername = document.querySelector("#user-username");
 const userDisplayName = document.querySelector("#user-display-name");
 const userRole = document.querySelector("#user-role");
-const userPassword = document.querySelector("#user-password");
 const userDisabled = document.querySelector("#user-disabled");
 const userSpaceOptions = document.querySelector("#user-space-options");
 const userList = document.querySelector("#user-list");
@@ -320,9 +319,11 @@ function resetUserForm() {
   }
   userForm.reset();
   userId.value = "";
+  userUsername.value = "";
+  userDisplayName.value = "";
   userRole.value = "member";
   renderUserSpaceOptions([]);
-  setUserMessage("新账号密码至少 8 位。");
+  setUserMessage("员工可自行注册；这里用于分配角色和项目权限。");
 }
 
 function renderUsers(users = []) {
@@ -331,13 +332,12 @@ function renderUsers(users = []) {
   }
   userList.className = "user-list";
   userList.innerHTML = users.map((user) => `
-    <button type="button" class="user-row" data-user-id="${escapeHtml(user.id)}"
-      data-user="${encodeURIComponent(JSON.stringify(user))}">
+    <button type="button" class="user-row${user.role === "admin" ? " admin-account" : ""}" ${user.role === "admin" ? "disabled" : `data-user-id="${escapeHtml(user.id)}" data-user="${encodeURIComponent(JSON.stringify(user))}"`}>
       <span class="user-avatar">${escapeHtml((user.displayName || user.username).slice(0, 1).toUpperCase())}</span>
       <span class="user-row-copy">
         <strong>${escapeHtml(user.displayName || user.username)}</strong>
         <small>${escapeHtml(user.username)} · ${escapeHtml(user.roleLabel)}${user.disabled ? " · 已停用" : ""}</small>
-        <em>${user.role === "admin" ? "全部项目" : `${user.spaces.length} 个项目`}</em>
+        <em>${user.role === "admin" ? "唯一超级管理员 · 全部项目" : user.spaces.length ? `${user.spaces.length} 个项目` : "等待分配项目"}</em>
       </span>
     </button>
   `).join("");
@@ -359,16 +359,17 @@ async function loadUsers() {
 
 async function saveUser(event) {
   event.preventDefault();
+  if (!userId.value) {
+    setUserMessage("请先从右侧选择一个已注册账号。", "error");
+    return;
+  }
   const spaces = Array.from(userSpaceOptions.querySelectorAll("input:checked")).map((input) => input.value);
   const response = await apiFetch("/api/users", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       id: userId.value,
-      username: userUsername.value.trim(),
-      displayName: userDisplayName.value.trim(),
       role: userRole.value,
-      password: userPassword.value,
       spaces,
       disabled: userDisabled.checked,
     }),
@@ -390,7 +391,6 @@ function editUser(button) {
   userUsername.value = user.username;
   userDisplayName.value = user.displayName;
   userRole.value = user.role;
-  userPassword.value = "";
   userDisabled.checked = user.disabled;
   renderUserSpaceOptions(user.spaces || []);
   setUserMessage(`正在编辑：${user.displayName || user.username}`);
@@ -402,6 +402,7 @@ function getAuditActionLabel(action) {
     "auth.setup": "初始化管理员",
     "auth.login": "登录",
     "auth.login.failed": "登录失败",
+    "auth.register": "员工注册",
     "auth.logout": "退出",
     ask: "知识问答",
     import: "资料入库",
@@ -719,7 +720,7 @@ async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledg
   if (!spaces.length) {
     renderSpaces([], "");
     setSpaceMessage("当前账号还没有被分配项目库，请联系管理员。", "error");
-    return;
+    return false;
   }
   const selected = spaces.some((space) => space.id === preferredSpace)
     ? preferredSpace
@@ -733,6 +734,55 @@ async function loadSpaces(preferredSpace = localStorage.getItem("currentKnowledg
       kbTargetSpace.value = selected;
     }
     localStorage.setItem("currentKnowledgeSpace", selected);
+  }
+  return true;
+}
+
+function showPendingAuthorization() {
+  if (spaceSelect) {
+    spaceSelect.disabled = true;
+    spaceSelect.innerHTML = '<option value="">等待管理员授权</option>';
+  }
+  if (chatTitle) {
+    chatTitle.textContent = "账号等待授权";
+  }
+  if (conversationBox) {
+    conversationBox.className = "conversation empty pending-access";
+    conversationBox.innerHTML = [
+      "<strong>账号已经注册成功</strong>",
+      "<span>超级管理员分配项目库后，你就可以开始查询公司知识。</span>",
+    ].join("");
+  }
+  if (questionInput) {
+    questionInput.disabled = true;
+    questionInput.placeholder = "等待管理员分配项目权限";
+  }
+  form?.querySelector('button[type="submit"]')?.setAttribute("disabled", "");
+  newChatButton?.setAttribute("disabled", "");
+  if (sourcesBox) {
+    sourcesBox.className = "sources empty";
+    sourcesBox.textContent = "授权后会显示可引用的项目资料。";
+  }
+}
+
+async function initializeApp() {
+  await loadCurrentUser();
+  const hasSpaces = await loadSpaces();
+  if (!hasSpaces) {
+    showPendingAuthorization();
+    if (currentUser?.role === "admin") {
+      await loadUsers();
+      await loadAuditLogs();
+    }
+    return;
+  }
+  await loadKnowledgeStatus();
+  await loadImportJobs();
+  await loadManagedFiles();
+  await loadUsers();
+  await loadAuditLogs();
+  if (chatSessionsBox) {
+    await initializeChatHistory();
   }
 }
 
@@ -1525,20 +1575,7 @@ kbDryRun?.addEventListener("click", () => runKnowledgeUpdate(true));
 kbUpdate?.addEventListener("click", () => runKnowledgeUpdate(false));
 syncImportMode();
 applyFileManagerCollapsed(isFileManagerCollapsed());
-loadCurrentUser()
-  .then(loadSpaces)
-  .then(loadKnowledgeStatus)
-  .then(loadImportJobs)
-  .then(loadManagedFiles)
-  .then(loadUsers)
-  .then(loadAuditLogs)
-  .then(() => {
-    if (chatSessionsBox) {
-      return initializeChatHistory();
-    }
-    return null;
-  })
-  .catch((error) => {
+initializeApp().catch((error) => {
     setSpaceMessage(
       error instanceof Error ? error.message : "项目库初始化失败。",
       "error"

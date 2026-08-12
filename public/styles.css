@@ -610,6 +610,22 @@ button:disabled {
   color: var(--muted);
 }
 
+.pending-access {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.pending-access strong {
+  color: var(--text);
+  font-size: 18px;
+}
+
+.pending-access span {
+  max-width: 420px;
+  line-height: 1.7;
+}
+
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1283,6 +1299,32 @@ button:disabled {
 .auth-card h2 {
   margin: 0;
   font-size: 28px;
+}
+
+.auth-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 4px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.auth-switch button {
+  min-height: 36px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.auth-switch button.active {
+  background: rgba(159, 216, 194, 0.12);
+  color: var(--accent-strong);
+}
+
+.user-row.admin-account {
+  cursor: default;
+  opacity: 0.8;
 }
 
 .auth-description {

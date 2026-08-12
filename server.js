@@ -2791,6 +2791,55 @@ async function handleLogin(request, response) {
   sendJson(response, 200, { ok: true, user: sanitizeUser(user) });
 }
 
+async function handleRegister(request, response) {
+  if (AUTH_STORE.users.length === 0) {
+    sendJson(response, 409, { error: "请先由部署电脑创建超级管理员" });
+    return;
+  }
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+  const username = normalizeUsername(payload.username);
+  const displayName = String(payload.displayName || "").trim().slice(0, 40);
+  const password = String(payload.password || "");
+  if (!/^[a-z0-9_.-]{3,32}$/.test(username)) {
+    sendJson(response, 400, { error: "账号需为 3-32 位字母、数字、点、横线或下划线" });
+    return;
+  }
+  if (!displayName) {
+    sendJson(response, 400, { error: "请输入你的姓名" });
+    return;
+  }
+  if (password.length < 8) {
+    sendJson(response, 400, { error: "密码至少需要 8 位" });
+    return;
+  }
+  if (AUTH_STORE.users.some((item) => item.username === username)) {
+    sendJson(response, 409, { error: "这个账号已经被注册" });
+    return;
+  }
+  const passwordData = await hashPassword(password);
+  const now = new Date().toISOString();
+  const user = {
+    id: randomUUID(),
+    username,
+    displayName,
+    role: "member",
+    spaces: [],
+    disabled: false,
+    passwordSalt: passwordData.salt,
+    passwordHash: passwordData.hash,
+    createdAt: now,
+    updatedAt: now,
+  };
+  AUTH_STORE.users.push(user);
+  await saveAuthStore(AUTH_STORE);
+  setSessionCookie(response, await createLoginSession(user.id));
+  await appendAuditLog({ request, user, action: "auth.register", target: user.username });
+  sendJson(response, 200, { ok: true, user: sanitizeUser(user), pendingAuthorization: true });
+}
+
 async function handleLogout(request, response) {
   const token = parseCookies(request)[SESSION_COOKIE];
   const sessionId = readSignedSessionId(token);
@@ -2822,64 +2871,31 @@ async function handleSaveUser(request, response) {
   if (!payload) {
     return;
   }
-  const username = normalizeUsername(payload.username);
-  const displayName = String(payload.displayName || payload.username || "").trim().slice(0, 40);
-  const password = String(payload.password || "");
-  const role = ["admin", "manager", "member"].includes(payload.role) ? payload.role : "member";
+  if (!["manager", "member"].includes(payload.role)) {
+    sendJson(response, 400, { error: "只能授予普通成员或资料管理员角色" });
+    return;
+  }
+  const role = payload.role;
   const availableSpaces = new Set((await listSpaces()).map((space) => space.id));
   const spaces = Array.from(new Set((Array.isArray(payload.spaces) ? payload.spaces : [])
     .map(normalizeSpaceId)
     .filter((space) => availableSpaces.has(space))));
-  if (!/^[a-z0-9_.-]{3,32}$/.test(username)) {
-    sendJson(response, 400, { error: "账号需为 3-32 位字母、数字、点、横线或下划线" });
-    return;
-  }
-  let user = payload.id ? AUTH_STORE.users.find((item) => item.id === payload.id) : null;
-  if (AUTH_STORE.users.some((item) => item.username === username && item.id !== user?.id)) {
-    sendJson(response, 409, { error: "这个账号已经存在" });
-    return;
-  }
-  if (!user && password.length < 8) {
-    sendJson(response, 400, { error: "新账号密码至少需要 8 位" });
-    return;
-  }
-  if (password && password.length < 8) {
-    sendJson(response, 400, { error: "密码至少需要 8 位" });
+  const user = payload.id ? AUTH_STORE.users.find((item) => item.id === payload.id) : null;
+  if (!user) {
+    sendJson(response, 404, { error: "没有找到这个注册账号，请让员工先自行注册" });
     return;
   }
   const now = new Date().toISOString();
-  if (!user) {
-    user = {
-      id: randomUUID(),
-      username,
-      displayName,
-      role,
-      spaces,
-      disabled: Boolean(payload.disabled),
-      createdAt: now,
-      updatedAt: now,
-    };
-    AUTH_STORE.users.push(user);
-  } else {
-    if (user.id === actor.id && (role !== "admin" || payload.disabled)) {
-      sendJson(response, 400, { error: "不能停用自己的账号或取消自己的超级管理员身份" });
-      return;
-    }
-    const activeAdmins = AUTH_STORE.users.filter((item) => item.role === "admin" && !item.disabled);
-    if (user.role === "admin" && activeAdmins.length === 1 && (role !== "admin" || payload.disabled)) {
-      sendJson(response, 400, { error: "系统必须至少保留一个可用的超级管理员" });
-      return;
-    }
-    Object.assign(user, { username, displayName, role, spaces, disabled: Boolean(payload.disabled), updatedAt: now });
+  if (user.role === "admin") {
+    sendJson(response, 400, { error: "超级管理员账号不可在员工授权页修改" });
+    return;
   }
-  if (password) {
-    const passwordData = await hashPassword(password);
-    user.passwordSalt = passwordData.salt;
-    user.passwordHash = passwordData.hash;
-    AUTH_STORE.sessions = AUTH_STORE.sessions.filter((session) => session.userId !== user.id || user.id === actor.id);
+  Object.assign(user, { role, spaces, disabled: Boolean(payload.disabled), updatedAt: now });
+  if (user.disabled) {
+    AUTH_STORE.sessions = AUTH_STORE.sessions.filter((session) => session.userId !== user.id);
   }
   await saveAuthStore(AUTH_STORE);
-  await appendAuditLog({ request, user: actor, action: payload.id ? "user.update" : "user.create", target: user.username, detail: `${role} / ${spaces.join(", ")}` });
+  await appendAuditLog({ request, user: actor, action: "user.update", target: user.username, detail: `${role} / ${spaces.join(", ")}` });
   sendJson(response, 200, { ok: true, user: sanitizeUser(user), users: AUTH_STORE.users.map(sanitizeUser) });
 }
 
@@ -2957,6 +2973,11 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "POST" && requestUrl.pathname === "/api/auth/login") {
     await handleLogin(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/auth/register") {
+    await handleRegister(request, response);
     return;
   }
 
