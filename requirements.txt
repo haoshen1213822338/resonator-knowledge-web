@@ -1,6 +1,7 @@
 python-docx
 pdfplumber
 pypdf
+pypdfium2
 openpyxl
 python-pptx
 rapidocr-onnxruntime

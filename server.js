@@ -23,6 +23,8 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || "https://api.deepseek.com")
   .replace(/\/+$/, "");
 const AI_API_KEY = process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "";
 const AI_MODEL = process.env.AI_MODEL || "deepseek-v4-flash";
+const AI_VISION_MODEL = process.env.AI_VISION_MODEL || AI_MODEL;
+const VISION_BATCH_SIZE = Math.max(1, Number(process.env.VISION_BATCH_SIZE || 6));
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
 const AUTH_STORE_PATH = path.join(DATA_DIR, "auth.json");
@@ -56,6 +58,7 @@ const VECTOR_CACHE_DIR = path.resolve(
 const vectorSearchWarnings = new Set();
 const vectorQueryCache = new Map();
 const VECTOR_QUERY_CACHE_TTL_MS = 5 * 60_000;
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   ".md",
   ".txt",
@@ -648,6 +651,7 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
     hasApiKey: Boolean(AI_API_KEY),
     aiProvider: AI_PROVIDER,
     aiModel: AI_MODEL,
+    aiVisionModel: AI_VISION_MODEL,
     vectorEnabled: VECTOR_ENABLED,
     vectorModel: VECTOR_MODEL,
     vectorIndex: vectorIndexInfo,
@@ -931,16 +935,20 @@ function parseExtractorProgressLine(line) {
   return null;
 }
 
-function runFileExtractor(filePath, onProgress = null) {
+function runFileExtractor(filePath, assetsDir, onProgress = null) {
   return new Promise((resolve, reject) => {
-    const child = spawn(PARSER_PYTHON_CMD, [FILE_EXTRACTOR_SCRIPT, filePath], {
+    const child = spawn(
+      PARSER_PYTHON_CMD,
+      [FILE_EXTRACTOR_SCRIPT, filePath, "--assets-dir", assetsDir],
+      {
       cwd: __dirname,
       env: {
         ...process.env,
         PYTHONIOENCODING: "utf-8",
       },
       windowsHide: true,
-    });
+      }
+    );
 
     let stdout = "";
     let stderr = "";
@@ -995,6 +1003,116 @@ function runFileExtractor(filePath, onProgress = null) {
   });
 }
 
+function getImageMimeType(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".png") return "image/png";
+  if (extension === ".webp") return "image/webp";
+  if (extension === ".bmp") return "image/bmp";
+  return "image/jpeg";
+}
+
+function buildVisualAnalysisPrompt(fileName, assets, batchIndex, totalBatches) {
+  const labels = assets.map((asset, index) => `${index + 1}. ${asset.label}`).join("\n");
+  return [
+    `你正在分析公司知识库文件《${fileName}》的视觉素材。`,
+    `当前为第 ${batchIndex}/${totalBatches} 批。`,
+    "请逐项理解画面，而不是只抄写可见文字。重点识别：",
+    "1. 页面或画面的主题、人物、对象、场景与相互关系；",
+    "2. 图表标题、指标、横纵轴、数据系列、变化趋势、峰值、异常点和可支持的结论；",
+    "3. 流程图、组织图、表格和版面结构所表达的业务逻辑；",
+    "4. 视频画面中的动作、场景变化、演示内容和关键事件；",
+    "5. 模糊、遮挡或无法确认之处必须标记为“待确认”，不得猜测。",
+    "请使用中文 Markdown 输出，每项以对应标签为三级标题，并分成“画面内容”“业务信息”“关键发现”“待确认”四部分。没有内容的部分可省略。",
+    "本批素材标签：",
+    labels,
+  ].join("\n");
+}
+
+async function analyzeVisualBatch(fileName, assets, batchIndex, totalBatches) {
+  const content = [
+    {
+      type: "text",
+      text: buildVisualAnalysisPrompt(fileName, assets, batchIndex, totalBatches),
+    },
+  ];
+
+  for (const asset of assets) {
+    const imageBuffer = await readFile(asset.path);
+    content.push({ type: "text", text: `视觉素材：${asset.label}` });
+    content.push({
+      type: "image_url",
+      image_url: {
+        url: `data:${getImageMimeType(asset.path)};base64,${imageBuffer.toString("base64")}`,
+      },
+    });
+  }
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const apiResponse = await fetch(`${AI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${AI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: AI_VISION_MODEL,
+        messages: [{ role: "user", content }],
+        stream: false,
+        temperature: 0.1,
+        max_tokens: 4000,
+      }),
+    });
+
+    const payload = await apiResponse.json().catch(() => ({}));
+    if (apiResponse.ok) {
+      return extractChatCompletionText(payload);
+    }
+    lastError = new Error(
+      payload.error?.message || `多模态接口请求失败：${apiResponse.status}`
+    );
+    if (![408, 429, 500, 502, 503, 504].includes(apiResponse.status) || attempt === 3) {
+      break;
+    }
+    await wait(600 * (2 ** (attempt - 1)));
+  }
+  throw lastError || new Error("多模态接口请求失败。");
+}
+
+async function analyzeVisualAssets(fileName, visualAssets = [], onProgress = null) {
+  if (!visualAssets.length) {
+    return "";
+  }
+  if (!AI_API_KEY) {
+    return "多模态视觉理解未执行：尚未配置 AI_API_KEY。";
+  }
+
+  const batches = [];
+  for (let index = 0; index < visualAssets.length; index += VISION_BATCH_SIZE) {
+    batches.push(visualAssets.slice(index, index + VISION_BATCH_SIZE));
+  }
+
+  const analyses = [];
+  for (const [index, batch] of batches.entries()) {
+    onProgress?.({
+      phase: "多模态画面理解",
+      progress: Math.round(((index + 0.2) / batches.length) * 100),
+      detail: `${index + 1}/${batches.length} 批`,
+    });
+    try {
+      const analysis = await analyzeVisualBatch(fileName, batch, index + 1, batches.length);
+      if (analysis) {
+        analyses.push(analysis);
+      }
+    } catch (error) {
+      analyses.push(
+        `### 第 ${index + 1} 批视觉素材\n\n多模态理解失败，已保留本地文字提取结果。错误：${error.message}`
+      );
+    }
+  }
+  return analyses.join("\n\n---\n\n");
+}
+
 function getExtractedFileName(filePath) {
   const parsed = path.parse(filePath);
   return `${parsed.name}_解析结果.md`;
@@ -1012,14 +1130,36 @@ async function loadUploadedDocuments(savedFiles, spaceRoot, onProgress = null) {
       phase: `解析文件 ${index + 1}/${totalFiles}`,
       progress: 0,
     });
-    const parsed = await runFileExtractor(filePath, (event) => {
-      onProgress?.({
-        ...event,
-        fileName,
-        fileIndex: index + 1,
-        totalFiles,
+    const assetsDir = path.join(DATA_DIR, "temp", `visual_${randomUUID()}`);
+    await mkdir(assetsDir, { recursive: true });
+    let parsed;
+    let visualAnalysis = "";
+    try {
+      parsed = await runFileExtractor(filePath, assetsDir, (event) => {
+        onProgress?.({
+          ...event,
+          progress: Math.round(Number(event.progress || 0) * 0.65),
+          fileName,
+          fileIndex: index + 1,
+          totalFiles,
+        });
       });
-    });
+      visualAnalysis = await analyzeVisualAssets(
+        fileName,
+        parsed.visualAssets || [],
+        (event) => {
+        onProgress?.({
+          ...event,
+          progress: 66 + Math.round(Number(event.progress || 0) * 0.32),
+          fileName,
+            fileIndex: index + 1,
+            totalFiles,
+          });
+        }
+      );
+    } finally {
+      await rm(assetsDir, { recursive: true, force: true });
+    }
     const extractedPath = path.join(path.dirname(filePath), getExtractedFileName(filePath));
     const extractedContent = [
       `# ${path.basename(filePath)} 解析结果`,
@@ -1032,13 +1172,20 @@ async function loadUploadedDocuments(savedFiles, spaceRoot, onProgress = null) {
       "",
       parsed.content || "未提取到可读文字。",
       "",
+      "## 多模态视觉理解",
+      "",
+      visualAnalysis || "该文件没有需要视觉理解的页面或画面。",
+      "",
     ].join("\n");
     await writeFile(extractedPath, extractedContent, "utf8");
     documents.push({
       fileName: path.basename(filePath),
       relativePath: path.relative(spaceRoot, filePath),
       extractedPath,
-      content: parsed.content || "",
+      content: [
+        visualAnalysis ? `## 多模态视觉理解\n\n${visualAnalysis}` : "",
+        parsed.content ? `## 本地提取文字\n\n${parsed.content}` : "",
+      ].filter(Boolean).join("\n\n"),
     });
     onProgress?.({
       fileName,
@@ -3398,6 +3545,7 @@ const server = createServer(async (request, response) => {
       aiProvider: AI_PROVIDER,
       aiBaseUrl: AI_BASE_URL,
       aiModel: AI_MODEL,
+      aiVisionModel: AI_VISION_MODEL,
       hasApiKey: Boolean(AI_API_KEY),
       vaultDir: VAULT_DIR,
       spacesRoot: SPACES_ROOT,

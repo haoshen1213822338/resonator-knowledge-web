@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +42,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -177,6 +180,205 @@ def extract_pptx(path: Path) -> str:
     return "\n\n".join(parts)
 
 
+def save_analysis_image(source: Path, target: Path, max_side: int = 1800) -> Path:
+    """Normalize a visual asset for reliable and economical model input."""
+
+    from PIL import Image
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source) as image:
+        image = image.convert("RGB")
+        image.thumbnail((max_side, max_side))
+        image.save(target, "JPEG", quality=84, optimize=True)
+    return target
+
+
+def render_pdf_pages(path: Path, assets_dir: Path) -> list[dict[str, str]]:
+    """Render every PDF page so scanned text, layouts and charts remain visible."""
+
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError("扫描 PDF 视觉解析需要安装 pypdfium2。") from exc
+
+    pdf = pdfium.PdfDocument(str(path))
+    assets: list[dict[str, str]] = []
+    total = max(1, len(pdf))
+    for page_index in range(len(pdf)):
+        emit_progress(
+            "渲染 PDF 页面",
+            45 + ((page_index + 1) / total) * 25,
+            f"{page_index + 1}/{total}",
+        )
+        page = pdf[page_index]
+        image = page.render(scale=1.6).to_pil().convert("RGB")
+        image.thumbnail((1800, 1800))
+        target = assets_dir / f"pdf_page_{page_index + 1:04d}.jpg"
+        image.save(target, "JPEG", quality=84, optimize=True)
+        assets.append({
+            "path": str(target),
+            "kind": "pdf_page",
+            "label": f"第 {page_index + 1} 页",
+        })
+    return assets
+
+
+def render_ppt_slides(path: Path, assets_dir: Path) -> list[dict[str, str]]:
+    """Render PPT slides through PowerPoint when available, with image fallback."""
+
+    export_dir = assets_dir / "ppt_slides"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+    if powershell and os.name == "nt":
+        script_path = assets_dir / "export_ppt.ps1"
+        script_path.write_text(
+            textwrap.dedent(
+                """
+                param([string]$InputPath, [string]$OutputDir)
+                $app = $null
+                $presentation = $null
+                try {
+                  $app = New-Object -ComObject PowerPoint.Application
+                  $presentation = $app.Presentations.Open($InputPath, $true, $true, $false)
+                  $presentation.Export($OutputDir, "JPG", 1600, 900)
+                } finally {
+                  if ($presentation) { $presentation.Close() }
+                  if ($app) { $app.Quit() }
+                }
+                """
+            ).strip(),
+            encoding="utf-8-sig",
+        )
+        try:
+            run_command([
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+                "-InputPath",
+                str(path.resolve()),
+                "-OutputDir",
+                str(export_dir.resolve()),
+            ])
+        except Exception:
+            pass
+
+    slide_images = sorted(
+        [*export_dir.glob("*.jpg"), *export_dir.glob("*.jpeg"), *export_dir.glob("*.png")],
+        key=lambda item: int("".join(filter(str.isdigit, item.stem)) or 0),
+    )
+    if slide_images:
+        return [
+            {"path": str(image), "kind": "ppt_slide", "label": f"幻灯片 {index}"}
+            for index, image in enumerate(slide_images, 1)
+        ]
+
+    # Linux deployments without LibreOffice/PowerPoint still retain embedded visuals.
+    from pptx import Presentation
+
+    presentation = Presentation(path)
+    assets: list[dict[str, str]] = []
+    for slide_index, slide in enumerate(presentation.slides, 1):
+        for shape_index, shape in enumerate(slide.shapes, 1):
+            image = getattr(shape, "image", None)
+            if image is None:
+                continue
+            suffix = f".{image.ext.lower()}"
+            source = assets_dir / f"slide_{slide_index:04d}_image_{shape_index:03d}{suffix}"
+            source.write_bytes(image.blob)
+            target = assets_dir / f"slide_{slide_index:04d}_image_{shape_index:03d}.jpg"
+            try:
+                save_analysis_image(source, target)
+            except Exception:
+                continue
+            assets.append({
+                "path": str(target),
+                "kind": "ppt_image",
+                "label": f"幻灯片 {slide_index} 内嵌图片 {shape_index}",
+            })
+    return assets
+
+
+def extract_docx_visuals(path: Path, assets_dir: Path) -> list[dict[str, str]]:
+    """Extract embedded Word images for semantic understanding."""
+
+    assets: list[dict[str, str]] = []
+    with zipfile.ZipFile(path) as archive:
+        media_names = sorted(
+            name for name in archive.namelist() if name.startswith("word/media/")
+        )
+        for index, media_name in enumerate(media_names, 1):
+            suffix = Path(media_name).suffix.lower() or ".bin"
+            source = assets_dir / f"docx_image_{index:04d}{suffix}"
+            source.write_bytes(archive.read(media_name))
+            target = assets_dir / f"docx_image_{index:04d}.jpg"
+            try:
+                save_analysis_image(source, target)
+            except Exception:
+                continue
+            assets.append({
+                "path": str(target),
+                "kind": "docx_image",
+                "label": f"Word 内嵌图片 {index}",
+            })
+    return assets
+
+
+def render_xlsx_pages(path: Path, assets_dir: Path) -> list[dict[str, str]]:
+    """Render Excel print pages through Excel so charts can be understood visually."""
+
+    powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+    if not powershell or os.name != "nt":
+        return []
+
+    pdf_path = assets_dir / "excel_render.pdf"
+    script_path = assets_dir / "export_excel.ps1"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            param([string]$InputPath, [string]$OutputPath)
+            $app = $null
+            $workbook = $null
+            try {
+              $app = New-Object -ComObject Excel.Application
+              $app.Visible = $false
+              $app.DisplayAlerts = $false
+              $workbook = $app.Workbooks.Open($InputPath, 0, $true)
+              $workbook.ExportAsFixedFormat(0, $OutputPath)
+            } finally {
+              if ($workbook) { $workbook.Close($false) }
+              if ($app) { $app.Quit() }
+            }
+            """
+        ).strip(),
+        encoding="utf-8-sig",
+    )
+    try:
+        run_command([
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+            "-InputPath",
+            str(path.resolve()),
+            "-OutputPath",
+            str(pdf_path.resolve()),
+        ])
+        if not pdf_path.exists():
+            return []
+        assets = render_pdf_pages(pdf_path, assets_dir / "excel_pages")
+        for index, asset in enumerate(assets, 1):
+            asset["kind"] = "xlsx_page"
+            asset["label"] = f"Excel 打印页面 {index}"
+        return assets
+    except Exception:
+        return []
+
+
 def extract_image(path: Path, report_progress: bool = True) -> str:
     """Extract visible text from an image by OCR."""
 
@@ -287,10 +489,11 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def extract_video(path: Path) -> str:
+def extract_video(path: Path, assets_dir: Path) -> tuple[str, list[dict[str, str]]]:
     """Extract speech transcript and frame OCR from a video."""
 
     emit_progress("准备视频解析", 5, path.name)
+    assets_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg = require_ffmpeg()
     interval = max(1, int(os.environ.get("VIDEO_FRAME_INTERVAL_SECONDS", "10")))
     max_frames = max(1, int(os.environ.get("VIDEO_MAX_KEYFRAMES", "120")))
@@ -298,7 +501,7 @@ def extract_video(path: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="kb_video_") as temp_dir:
         temp_path = Path(temp_dir)
         audio_path = temp_path / "audio.wav"
-        frame_pattern = str(temp_path / "frame_%05d.jpg")
+        frame_pattern = str(assets_dir / "video_frame_%05d.jpg")
 
         emit_progress("抽取视频音频", 14, path.name)
         run_command([
@@ -331,7 +534,7 @@ def extract_video(path: Path) -> str:
                 str(max_frames),
                 frame_pattern,
             ])
-            frames = sorted(temp_path.glob("frame_*.jpg"))
+            frames = sorted(assets_dir.glob("video_frame_*.jpg"))
             total_frames = max(1, len(frames))
             for index, frame in enumerate(frames):
                 emit_progress(
@@ -354,10 +557,18 @@ def extract_video(path: Path) -> str:
         "## 视频画面文字 OCR",
         "\n\n".join(frame_ocr_lines) or "未识别到画面文字。",
     ]
-    return "\n".join(parts)
+    visual_assets = [
+        {
+            "path": str(frame),
+            "kind": "video_frame",
+            "label": f"视频时间 {format_timestamp(index * interval)}",
+        }
+        for index, frame in enumerate(sorted(assets_dir.glob("video_frame_*.jpg")))
+    ]
+    return "\n".join(parts), visual_assets
 
 
-def extract_file(path: Path) -> str:
+def extract_file(path: Path, assets_dir: Path) -> tuple[str, list[dict[str, str]]]:
     """Extract text from one supported file."""
 
     emit_progress("开始解析文件", 1, path.name)
@@ -366,27 +577,33 @@ def extract_file(path: Path) -> str:
         raise ValueError(f"不支持的文件类型：{extension}")
 
     if extension in {".md", ".txt", ".csv"}:
-        return read_text_file(path)
+        return read_text_file(path), []
     if extension == ".docx":
-        return extract_docx(path)
+        return extract_docx(path), extract_docx_visuals(path, assets_dir)
     if extension == ".pdf":
-        return extract_pdf(path)
+        content = extract_pdf(path)
+        return content, render_pdf_pages(path, assets_dir)
     if extension == ".xlsx":
-        return extract_xlsx(path)
+        return extract_xlsx(path), render_xlsx_pages(path, assets_dir)
     if extension == ".pptx":
-        return extract_pptx(path)
-    if extension in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
-        return extract_image(path)
+        content = extract_pptx(path)
+        return content, render_ppt_slides(path, assets_dir)
+    if extension in IMAGE_EXTENSIONS:
+        content = extract_image(path)
+        target = save_analysis_image(path, assets_dir / "image_0001.jpg")
+        return content, [{"path": str(target), "kind": "image", "label": "原始图片"}]
     if extension in VIDEO_EXTENSIONS:
-        return extract_video(path)
+        return extract_video(path, assets_dir)
 
     raise ValueError(f"不支持的文件类型：{extension}")
 
 
-def build_payload(path: Path) -> dict[str, Any]:
+def build_payload(path: Path, assets_dir: Path) -> dict[str, Any]:
     """Build the JSON response consumed by the Node backend."""
 
-    content = extract_file(path).strip()
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    content, visual_assets = extract_file(path, assets_dir)
+    content = content.strip()
     emit_progress("文件解析完成", 100, path.name)
     return {
         "ok": True,
@@ -394,6 +611,7 @@ def build_payload(path: Path) -> dict[str, Any]:
         "extension": path.suffix.lower(),
         "characters": len(content),
         "content": content,
+        "visualAssets": visual_assets,
     }
 
 
@@ -402,6 +620,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Extract text from a document file.")
     parser.add_argument("file", type=Path)
+    parser.add_argument("--assets-dir", type=Path)
     return parser.parse_args()
 
 
@@ -410,7 +629,8 @@ def main() -> int:
 
     args = parse_args()
     try:
-        payload = build_payload(args.file)
+        assets_dir = args.assets_dir or Path(tempfile.mkdtemp(prefix="kb_visual_assets_"))
+        payload = build_payload(args.file, assets_dir)
     except Exception as exc:  # noqa: BLE001 - CLI must return structured errors.
         print(
             json.dumps(

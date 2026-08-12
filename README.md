@@ -11,7 +11,8 @@
 - 使用本地中文向量模型进行段落级语义检索，并与关键词、项目别名混合排序
 - 读取本地 Obsidian/Markdown 知识库中的 `90_AI输出`
 - 根据问题搜索相关 Markdown 文件
-- 调用 DeepSeek API 生成可追溯回答
+- 调用 OpenAI 兼容 API 生成可追溯回答
+- 结合本地 OCR、语音转写和多模态模型理解图片、扫描 PDF、PPT 图表与视频关键帧
 - 在回答区展示引用来源和知识片段
 - 使用品牌化暗色视觉、动态共振背景和鼠标响应效果
 
@@ -50,17 +51,19 @@ D:\Wecaht\聊天记录\wechat_kb_test_export\90_AI输出
 KNOWLEDGE_DIR=D:\Wecaht\聊天记录\wechat_kb_test_export\90_AI输出
 ```
 
-## DeepSeek 配置
+## AI 与多模态模型配置
 
 复制 `.env.example` 为 `.env`，然后填写：
 
 ```text
 PORT=3030
 KNOWLEDGE_DIR=D:\Wecaht\聊天记录\wechat_kb_test_export\90_AI输出
-AI_PROVIDER=deepseek
-AI_BASE_URL=https://api.deepseek.com
-AI_MODEL=deepseek-v4-flash
-AI_API_KEY=你的 DeepSeek API Key
+AI_PROVIDER=openai-compatible
+AI_BASE_URL=https://你的兼容接口地址/v1
+AI_MODEL=gemini-2.5-flash
+AI_VISION_MODEL=gemini-2.5-flash
+VISION_BATCH_SIZE=6
+AI_API_KEY=你的 API Key
 ```
 
 注意：
@@ -69,6 +72,8 @@ AI_API_KEY=你的 DeepSeek API Key
 - `.env` 已被 `.gitignore` 忽略，不能提交到 GitHub
 - 前端网页不保存 API Key
 - 后端先检索本地知识库，再把相关片段交给 AI 生成答案
+- 原始文件保存在本地；视觉分析时只把压缩后的图片、PDF 页面、PPT 幻灯片或视频关键帧发送给配置的模型服务商
+- 本地向量模型与生成模型相互独立，切换多模态模型不会重建现有检索架构
 
 ## 版本管理
 
