@@ -255,7 +255,9 @@ function renderSources(citations) {
             <span class="source-index">${index + 1}</span>
             <p class="source-title">${escapeHtml(item.file)}</p>
           </div>
+          ${item.locator ? `<div class="source-locator">${escapeHtml(item.locator)}</div>` : ""}
           <div class="source-meta">${escapeHtml(item.retrieval || "关键词")}命中 · 综合相关度：${item.score}</div>
+          ${item.sourcePath ? `<div class="source-path" title="${escapeHtml(item.sourcePath)}">${escapeHtml(item.sourcePath)}</div>` : ""}
           <details class="source-details">
             <summary>查看引用片段</summary>
             <div class="source-snippet">${escapeHtml(item.snippet)}</div>

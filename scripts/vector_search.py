@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_MODEL = "BAAI/bge-small-zh-v1.5"
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,11 @@ class Chunk:
     path: str
     heading: str
     text: str
+    source_file: str
+    source_path: str
+    source_type: str
+    project: str
+    locations: list[dict[str, Any]]
 
 
 def write_event(event: str, **payload: Any) -> None:
@@ -68,11 +74,100 @@ def split_long_text(text: str, max_chars: int = 900, overlap: int = 140) -> list
     return chunks
 
 
+def parse_frontmatter(content: str) -> dict[str, Any]:
+    """Read the flat YAML fields used by generated citation evidence files."""
+
+    text = content.lstrip("\ufeff")
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    metadata: dict[str, Any] = {}
+    for line in text[3:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        cleaned = value.strip()
+        if cleaned.startswith(('"', "'")):
+            try:
+                cleaned = json.loads(cleaned)
+            except json.JSONDecodeError:
+                cleaned = cleaned[1:-1]
+        metadata[key.strip()] = cleaned
+    return metadata
+
+
+def timestamp_seconds(timestamp: str) -> int:
+    """Convert a HH:MM:SS timecode to seconds."""
+
+    hours, minutes, seconds = (int(value) for value in timestamp.split(":"))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def extract_locations(text: str, source_type: str) -> list[dict[str, Any]]:
+    """Extract stable PDF, slide, and video locations from one passage."""
+
+    extension = source_type.lower()
+    locations: list[dict[str, Any]] = []
+    if not extension or extension == ".pdf":
+        for match in re.finditer(r"(?:^|[#\s])第\s*(\d+)\s*页(?=$|[\s：:])", text, re.MULTILINE):
+            page = int(match.group(1))
+            locations.append({"type": "page", "label": f"第 {page} 页", "page": page})
+    if not extension or extension in {".ppt", ".pptx"}:
+        for match in re.finditer(r"(?:^|[#\s])幻灯片\s*(\d+)(?=$|[\s：:])", text, re.MULTILINE):
+            slide = int(match.group(1))
+            locations.append({"type": "slide", "label": f"幻灯片 {slide}", "slide": slide})
+    if not extension or extension in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}:
+        pattern = r"\b(\d{2}:\d{2}:\d{2})(?:\s*[-–—至到]\s*(\d{2}:\d{2}:\d{2}))?"
+        for match in re.finditer(pattern, text):
+            start = match.group(1)
+            end = match.group(2) or ""
+            label = f"{start}–{end}" if end and end != start else start
+            locations.append({
+                "type": "time",
+                "label": label,
+                "start": start,
+                "end": end,
+                "startSeconds": timestamp_seconds(start),
+                "endSeconds": timestamp_seconds(end) if end else None,
+            })
+    unique: dict[str, dict[str, Any]] = {}
+    for location in locations:
+        unique.setdefault(f"{location['type']}:{location['label']}", location)
+    return list(unique.values())[:8]
+
+
+def split_timed_section(heading: str, lines: list[str]) -> list[tuple[str, list[str]]]:
+    """Split video transcript sections at each timestamp for precise retrieval."""
+
+    marker = re.compile(r"^-\s*(\d{2}:\d{2}:\d{2})(?:\s*[-–—至到]\s*\d{2}:\d{2}:\d{2})?")
+    groups: list[tuple[str, list[str]]] = []
+    current_heading = heading
+    current_lines: list[str] = []
+    for line in lines:
+        match = marker.match(line.strip())
+        if match and current_lines:
+            groups.append((current_heading, current_lines))
+            current_lines = []
+        if match:
+            current_heading = f"{heading} {match.group(1)}".strip()
+        current_lines.append(line)
+    if current_lines:
+        groups.append((current_heading, current_lines))
+    return groups
+
+
 def chunk_markdown(path: Path, root: Path) -> list[Chunk]:
     """Split one Markdown file into heading-aware semantic passages."""
 
     content = path.read_text(encoding="utf-8", errors="replace")
+    metadata = parse_frontmatter(content)
     relative = str(path.relative_to(root))
+    source_file = str(metadata.get("source_file") or path.name)
+    source_path = str(metadata.get("source_path") or relative)
+    source_type = str(metadata.get("source_type") or Path(source_file).suffix).lower()
+    project = str(metadata.get("project") or "")
     sections: list[tuple[str, list[str]]] = []
     heading = path.stem
     lines: list[str] = []
@@ -87,6 +182,13 @@ def chunk_markdown(path: Path, root: Path) -> list[Chunk]:
             lines.append(line)
     if lines:
         sections.append((heading, lines))
+
+    if source_type in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}:
+        sections = [
+            timed_section
+            for section_heading, section_lines in sections
+            for timed_section in split_timed_section(section_heading, section_lines)
+        ]
 
     chunks: list[Chunk] = []
     for section_index, (section_heading, section_lines) in enumerate(sections):
@@ -105,6 +207,11 @@ def chunk_markdown(path: Path, root: Path) -> list[Chunk]:
                     path=str(path),
                     heading=section_heading,
                     text=searchable,
+                    source_file=source_file,
+                    source_path=source_path,
+                    source_type=source_type,
+                    project=project,
+                    locations=extract_locations(searchable, source_type),
                 )
             )
     return chunks
@@ -153,17 +260,20 @@ def build_index(
     files = sorted(knowledge_dir.rglob("*.md"))
     hashes = {str(path.relative_to(knowledge_dir)): sha256_file(path) for path in files}
     previous = read_index(index_path)
-    if (
-        not force
-        and previous
+    previous_compatible = bool(
+        previous
         and previous.get("version") == INDEX_VERSION
         and previous.get("model") == model_name
+    )
+    if (
+        not force
+        and previous_compatible
         and previous.get("files") == hashes
     ):
         return previous
 
     previous_chunks: dict[str, list[dict[str, Any]]] = {}
-    if previous and previous.get("model") == model_name:
+    if previous_compatible:
         for item in previous.get("chunks", []):
             relative_path = item.get("relativePath", "")
             previous_chunks.setdefault(relative_path, []).append(item)
@@ -171,7 +281,7 @@ def build_index(
     unchanged_files = {
         relative_path
         for relative_path, file_hash in hashes.items()
-        if previous
+        if previous_compatible
         and previous.get("files", {}).get(relative_path) == file_hash
         and relative_path in previous_chunks
     }
@@ -220,6 +330,11 @@ def build_index(
                 "relativePath": str(Path(chunk.path).relative_to(knowledge_dir)),
                 "heading": chunk.heading,
                 "text": chunk.text,
+                "sourceFile": chunk.source_file,
+                "sourcePath": chunk.source_path,
+                "sourceType": chunk.source_type,
+                "project": chunk.project,
+                "locations": chunk.locations,
                 "vector": vector,
             }
             for chunk, vector in zip(fresh_chunks, vectors, strict=True)
@@ -272,6 +387,11 @@ def search_index(
                 "relativePath": chunk.get("relativePath", chunk["file"]),
                 "heading": chunk["heading"],
                 "text": chunk["text"],
+                "sourceFile": chunk.get("sourceFile", chunk["file"]),
+                "sourcePath": chunk.get("sourcePath", chunk.get("relativePath", chunk["file"])),
+                "sourceType": chunk.get("sourceType", Path(chunk.get("sourceFile", chunk["file"])).suffix.lower()),
+                "project": chunk.get("project", ""),
+                "locations": chunk.get("locations", []),
                 "semanticScore": round(cosine_similarity(query_vector, chunk["vector"]), 6),
             }
             for chunk in index["chunks"]

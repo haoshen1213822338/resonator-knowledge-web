@@ -17,6 +17,12 @@ import process from "node:process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { createPersistence } from "./lib/persistence.js";
+import {
+  buildCitationEvidence,
+  decorateCitation,
+  formatCitationLocator,
+  readCitationMetadata,
+} from "./lib/citations.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -600,6 +606,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
   const rawDir = path.join(root, "00_原始资料");
   const uploadRoot = path.join(rawDir, "网页上传");
   const knowledgeDir = path.join(root, "90_AI输出");
+  const citationDir = path.join(knowledgeDir, "_引用证据");
   const systemDir = path.join(root, "99_系统配置");
   const chatDir = path.join(systemDir, "chat_sessions");
   const updateLogDir = path.join(systemDir, "update_logs");
@@ -615,6 +622,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
     rawDir,
     uploadRoot,
     knowledgeDir,
+    citationDir,
     systemDir,
     chatDir,
     updateLogDir,
@@ -628,6 +636,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
       rawDir,
       uploadRoot,
       knowledgeDir,
+      citationDir,
       systemDir,
       chatDir,
       path.join(systemDir, "scripts"),
@@ -763,6 +772,9 @@ async function listManagedFiles(spaceId = DEFAULT_SPACE_ID, { type = "all", quer
         continue;
       }
       if (isPathInside(paths.uploadSessionDir, filePath)) {
+        continue;
+      }
+      if (isPathInside(paths.citationDir, filePath)) {
         continue;
       }
       const info = await stat(filePath);
@@ -1073,10 +1085,12 @@ async function readVectorIndexStatus(indexPath) {
 function buildKnowledgeContext(results) {
   return results
     .map((item, index) => {
+      const locator = item.locator || formatCitationLocator(item.locations);
       return [
-        `[${index + 1}] ${item.file}`,
+        `[${index + 1}] ${item.sourceFile || item.file}${locator ? `｜${locator}` : ""}`,
+        item.sourcePath ? `原始位置：${item.sourcePath}` : "",
         item.snippet,
-      ].join("\n");
+      ].filter(Boolean).join("\n");
     })
     .join("\n\n---\n\n");
 }
@@ -1222,7 +1236,9 @@ async function callAI(question, results, history = []) {
     "如果用户问怎么办、怎么做、下一步，优先输出可执行步骤，而不是长篇背景解释。",
     "你可以结合上一轮对话理解追问、省略指代和连续任务。",
     "不要输出手机号、订单号、账号、密码、验证码等敏感信息。",
-    "最后用“参考：文件名”列出用到的知识文件。",
+    "知识片段前的方括号编号是引用编号。关键事实后必须标注对应编号，例如[1]。",
+    "如果来源提供了页码、幻灯片或视频时间，必须在正文或参考中保留精确位置，例如[1，第 6 页]、[2，幻灯片 9]、[3，00:02:10–00:02:24]。",
+    "最后用“参考：原始文件名｜精确位置”列出真正用到的来源，不要把引用证据 Markdown 文件当作原始来源。",
   ].join("\n");
 
   if (AI_PROVIDER === "openai-responses") {
@@ -1568,6 +1584,7 @@ async function loadUploadedDocuments(savedFiles, spaceRoot, onProgress = null) {
     documents.push({
       fileName: path.basename(filePath),
       relativePath: path.relative(spaceRoot, filePath),
+      extension: parsed.extension,
       extractedPath,
       content: [
         visualAnalysis ? `## 多模态视觉理解\n\n${visualAnalysis}` : "",
@@ -1891,7 +1908,56 @@ function buildMetadataBlock({ project, mode, content, savedFiles, aliasGroups })
     "",
   ].join("\n");
 }
-async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedFiles, content }) {
+
+function getCitationEvidencePath(paths, sourcePath, sourceFile) {
+  const identity = String(sourcePath || sourceFile || "unknown").replace(/\\/g, "/").toLowerCase();
+  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 12);
+  const baseName = safePathSegment(path.parse(sourceFile || "未知文件").name).slice(0, 80);
+  return path.join(paths.citationDir, `${baseName}_引用证据_${digest}.md`);
+}
+
+async function writeCitationEvidenceDocument(paths, document, project) {
+  const sourceFile = document.fileName || path.basename(document.relativePath || "未知文件");
+  const sourcePath = String(document.relativePath || sourceFile).replace(/\\/g, "/");
+  const sourceType = String(document.extension || path.extname(sourceFile)).toLowerCase();
+  const evidenceContent = buildCitationEvidence({
+    project,
+    sourceFile,
+    sourcePath,
+    sourceType,
+    content: document.content,
+  });
+  const evidencePath = getCitationEvidencePath(paths, sourcePath, sourceFile);
+  const existing = await readKnowledgeText(evidencePath).catch(() => "");
+  if (existing !== evidenceContent) {
+    await writeKnowledgeText(evidencePath, evidenceContent);
+  }
+  return evidencePath;
+}
+
+async function syncExistingCitationEvidence(spaceId) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const parsedFiles = (await listFilesRecursive(paths.rawDir, new Set([".md"])))
+    .filter((filePath) => filePath.endsWith("_解析结果.md"));
+  let created = 0;
+  for (const parsedPath of parsedFiles) {
+    const parsedContent = await readFile(parsedPath, "utf8").catch(() => "");
+    if (!parsedContent) continue;
+    const sourcePath = parsedContent.match(/^\s*-\s*原文件[：:]\s*(.+)$/mu)?.[1]?.trim() || "";
+    if (!sourcePath) continue;
+    const sourceType = parsedContent.match(/^\s*-\s*文件类型[：:]\s*(.+)$/mu)?.[1]?.trim() || path.extname(sourcePath);
+    const evidencePath = await writeCitationEvidenceDocument(paths, {
+      fileName: path.basename(sourcePath),
+      relativePath: sourcePath,
+      extension: sourceType,
+      content: parsedContent,
+    }, path.basename(path.dirname(parsedPath)));
+    if (evidencePath) created += 1;
+  }
+  return created;
+}
+
+async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedFiles, documents, content }) {
   const paths = await ensureKnowledgeBase(spaceId);
 
   const outputFileName = getOutputFileName(project, outputName);
@@ -1927,6 +1993,10 @@ async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedF
   ].join("\n");
 
   await writeKnowledgeText(outputPath, finalContent);
+  const citationFiles = [];
+  for (const document of documents || []) {
+    citationFiles.push(await writeCitationEvidenceDocument(paths, document, project));
+  }
 
   const logPath = path.join(
     paths.updateLogDir,
@@ -1939,6 +2009,7 @@ async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedF
       mode,
       outputPath,
       sourceFiles: savedFiles,
+      citationFiles,
       model: AI_MODEL,
       createdAt,
     }, null, 2),
@@ -1960,7 +2031,7 @@ async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedF
     "utf8"
   );
 
-  return { outputPath, logPath };
+  return { outputPath, logPath, citationFiles };
 }
 
 function normalizeText(text) {
@@ -2199,6 +2270,47 @@ function buildKeywordSnippet(content, tokens) {
   return sliceSection(lines, start);
 }
 
+function buildPreciseCitationSnippet(content, tokens, metadata) {
+  const lines = stripLowValueSections(content).split(/\r?\n/);
+  let hitIndex = -1;
+  let bestScore = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const lowerLine = lines[index].toLowerCase();
+    const score = tokens.reduce(
+      (total, token) => total + (lowerLine.includes(token) ? Math.min(token.length, 10) : 0),
+      0
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      hitIndex = index;
+    }
+  }
+  if (hitIndex < 0) return "";
+
+  const sourceType = String(metadata.source_type || "").toLowerCase();
+  const locatorPattern = sourceType === ".pdf"
+    ? /^#{1,4}\s*第\s*\d+\s*页(?:\s|$)/
+    : [".ppt", ".pptx"].includes(sourceType)
+      ? /^#{1,4}\s*幻灯片\s*\d+(?:\s|$)/
+      : /^(?:#{1,4}\s*(?:视频时间\s*)?\d{2}:\d{2}:\d{2}|-\s*\d{2}:\d{2}:\d{2}\s*[-–—至到])/;
+
+  let start = hitIndex;
+  for (let index = hitIndex; index >= 0; index -= 1) {
+    if (locatorPattern.test(lines[index].trim())) {
+      start = index;
+      break;
+    }
+  }
+  let end = Math.min(lines.length, start + 18);
+  for (let index = start + 1; index < end; index += 1) {
+    if (locatorPattern.test(lines[index].trim())) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n").trim().slice(0, 1800);
+}
+
 function mergeSnippets(snippets) {
   const merged = [];
   const seen = new Set();
@@ -2226,13 +2338,21 @@ function buildSnippet(content, tokens, question = "", intent = "general") {
   const leadSnippet = buildLeadSnippet(content);
   const intentSnippet = buildIntentSnippet(content, intent);
   const keywordSnippet = buildKeywordSnippet(content, tokens);
+  const metadata = readCitationMetadata(content);
+  const isCitationEvidence = metadata.citation_evidence === true || metadata.citation_evidence === "true";
+
+  if (isCitationEvidence) {
+    const preciseSnippet = buildPreciseCitationSnippet(content, tokens, metadata);
+    return mergeSnippets([preciseSnippet || keywordSnippet, intentSnippet]);
+  }
 
   return mergeSnippets([leadSnippet, intentSnippet, keywordSnippet]) || leadSnippet;
 }
 
 function scoreDocument(content, fileName, tokens, question = "", aliasGroups = []) {
+  const metadata = readCitationMetadata(content);
   const lowerContent = stripLowValueSections(content).toLowerCase();
-  const lowerFileName = fileName.toLowerCase();
+  const lowerFileName = `${fileName} ${metadata.source_file || ""} ${metadata.project || ""}`.toLowerCase();
   let score = 0;
   for (const token of tokens) {
     const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -2241,7 +2361,12 @@ function scoreDocument(content, fileName, tokens, question = "", aliasGroups = [
     score += contentCount * Math.min(token.length, 10);
     score += fileCount * Math.min(token.length, 10) * 4;
   }
-  score += scoreAliasMatch(content, fileName, question, aliasGroups);
+  score += scoreAliasMatch(
+    `${metadata.project || ""}\n${content}`,
+    metadata.source_file || fileName,
+    question,
+    aliasGroups
+  );
   return score;
 }
 
@@ -2387,6 +2512,8 @@ function mergeHybridResults(keywordResults, semanticResults, question, aliasGrou
 
   keywordResults.forEach((item, rank) => {
     const key = resultKey(item);
+    const citationContext = `${item.citationMetadata?.project || ""}\n${item.snippet || ""}`;
+    const citationFile = item.citationMetadata?.source_file || item.file;
     candidates.set(key, {
       ...item,
       keywordScore: item.score,
@@ -2394,7 +2521,7 @@ function mergeHybridResults(keywordResults, semanticResults, question, aliasGrou
       retrieval: "关键词",
       hybridScore: 0.44 * (item.score / maxKeywordScore) + 0.12 / (rank + 1),
       semanticSnippets: [],
-      projectMatch: scoreAliasMatch(item.snippet, item.file, question, aliasGroups) > 0,
+      projectMatch: scoreAliasMatch(citationContext, citationFile, question, aliasGroups) > 0,
     });
   });
 
@@ -2402,6 +2529,7 @@ function mergeHybridResults(keywordResults, semanticResults, question, aliasGrou
     const key = resultKey(item);
     const semanticScore = Math.max(0, Number(item.semanticScore || 0));
     const existing = candidates.get(key) || {
+      ...item,
       file: item.file,
       path: item.path,
       relativePath: item.relativePath || item.file,
@@ -2414,18 +2542,31 @@ function mergeHybridResults(keywordResults, semanticResults, question, aliasGrou
       semanticSnippets: [],
       projectMatch: false,
     };
+    existing.sourceFile ||= item.sourceFile || "";
+    existing.sourcePath ||= item.sourcePath || "";
+    existing.sourceType ||= item.sourceType || "";
+    existing.project ||= item.project || "";
+    existing.locations = [
+      ...(Array.isArray(existing.locations) ? existing.locations : []),
+      ...(Array.isArray(item.locations) ? item.locations : []),
+    ];
     existing.semanticScore = Math.max(existing.semanticScore, semanticScore);
     existing.hybridScore += 0.48 * semanticScore + 0.1 / (rank + 1);
     existing.retrieval = existing.keywordScore > 0 ? "混合" : "语义";
     if (item.text && !existing.semanticSnippets.includes(item.text)) {
       existing.semanticSnippets.push(item.text);
     }
-    existing.projectMatch = existing.projectMatch || scoreAliasMatch(item.text, item.file, question, aliasGroups) > 0;
+    existing.projectMatch = existing.projectMatch || scoreAliasMatch(
+      `${item.project || ""}\n${item.text || ""}`,
+      item.sourceFile || item.file,
+      question,
+      aliasGroups
+    ) > 0;
     candidates.set(key, existing);
   });
 
   return Array.from(candidates.values())
-    .map((item) => ({
+    .map((item) => decorateCitation({
       ...item,
       score: Math.round(item.hybridScore * 1000),
       snippet: mergeSnippets([
@@ -2462,6 +2603,7 @@ async function searchKnowledge(question, spaceId = DEFAULT_SPACE_ID) {
         relativePath: path.relative(paths.knowledgeDir, filePath),
         score,
         snippet: buildSnippet(content, tokens, question, intent),
+        citationMetadata: readCitationMetadata(content),
       });
     }
   }
@@ -3428,6 +3570,7 @@ async function runImportJob(spaceId, jobId) {
       mode: job.mode,
       outputName: job.outputName,
       savedFiles: job.savedFiles,
+      documents,
       content: organizedContent,
     });
 
@@ -4599,6 +4742,7 @@ async function handleRebuildVectorIndex(request, response) {
   }
   try {
     const paths = await ensureKnowledgeBase(space);
+    await syncExistingCitationEvidence(space);
     const result = await runVectorCommand(paths, "build", "", Boolean(payload.force));
     for (const cacheKey of vectorQueryCache.keys()) {
       if (cacheKey.startsWith(`${paths.id}:`)) {
@@ -4966,6 +5110,11 @@ if (KNOWLEDGE_ENCRYPTION_ENABLED) {
   await getKnowledgeEncryptionKey();
 }
 await ensureKnowledgeBase(DEFAULT_SPACE_ID);
+for (const space of await listSpaces()) {
+  await syncExistingCitationEvidence(space.id).catch((error) => {
+    console.warn(`引用证据同步失败（${space.id}）：${error.message}`);
+  });
+}
 await migrateLegacyDataToPostgres();
 await resumePendingImportJobs();
 setTimeout(processImportQueue, 0);
