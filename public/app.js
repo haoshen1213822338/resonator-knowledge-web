@@ -50,6 +50,7 @@ const rebuildVectorIndexButton = document.querySelector("#rebuild-vector-index")
 const encryptionState = document.querySelector("#encryption-state");
 const encryptionDetail = document.querySelector("#encryption-detail");
 const migrateEncryptionButton = document.querySelector("#migrate-encryption");
+const databaseState = document.querySelector("#database-state");
 const kbPath = document.querySelector("#kb-path");
 const refreshStatus = document.querySelector("#refresh-status");
 const importPanel = document.querySelector("#import-panel");
@@ -1042,6 +1043,13 @@ function renderKnowledgeStatus(status) {
     const canMigrate = currentUser?.role === "admin" &&
       status.encryption?.enabled && Number(status.encryption?.plaintextFiles || 0) > 0;
     migrateEncryptionButton.classList.toggle("hidden", !canMigrate);
+  }
+  if (databaseState) {
+    databaseState.textContent = status.persistence?.enabled
+      ? status.persistence.ok
+        ? `PostgreSQL · ${status.persistence.latencyMs ?? "-"}ms`
+        : "PostgreSQL 异常"
+      : "本地兼容模式";
   }
   if (kbPath) {
     kbPath.textContent = [

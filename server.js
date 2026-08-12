@@ -16,6 +16,7 @@ import path from "node:path";
 import process from "node:process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { createPersistence } from "./lib/persistence.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,6 +41,12 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
 const AUTH_STORE_PATH = path.join(DATA_DIR, "auth.json");
 const AUDIT_LOG_PATH = path.join(DATA_DIR, "audit.ndjson");
+const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
+const DATABASE_SSL = ["1", "true", "enabled", "require"].includes(
+  String(process.env.DATABASE_SSL || "false").toLowerCase()
+);
+const PERSISTENCE = createPersistence({ databaseUrl: DATABASE_URL, ssl: DATABASE_SSL });
+await PERSISTENCE.initialize();
 const KNOWLEDGE_ENCRYPTION_ENABLED = !["0", "false", "disabled"].includes(
   String(process.env.KNOWLEDGE_ENCRYPTION_ENABLED || "true").toLowerCase()
 );
@@ -124,6 +131,7 @@ const VIDEO_UPLOAD_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm"
 const MAX_CONCURRENT_IMPORT_JOBS = 1;
 const activeImportJobs = new Set();
 const pendingImportJobs = [];
+let queueWorkerBusy = false;
 const PROJECT_STOP_WORDS = new Set([
   "梦星",
   "鸣潮",
@@ -258,9 +266,19 @@ async function loadAuthStore() {
 async function saveAuthStore(store) {
   await mkdir(DATA_DIR, { recursive: true });
   await writeFile(AUTH_STORE_PATH, JSON.stringify(store, null, 2), "utf8");
+  await PERSISTENCE.saveAuthStore(store);
 }
 
-let AUTH_STORE = await loadAuthStore();
+let AUTH_STORE = await PERSISTENCE.loadAuthStore(await loadAuthStore());
+let authStoreRefreshedAt = Date.now();
+
+async function refreshAuthStore(force = false) {
+  if (!PERSISTENCE.enabled) return AUTH_STORE;
+  if (!force && Date.now() - authStoreRefreshedAt < 1000) return AUTH_STORE;
+  AUTH_STORE = await PERSISTENCE.loadAuthStore(AUTH_STORE);
+  authStoreRefreshedAt = Date.now();
+  return AUTH_STORE;
+}
 
 function normalizeUsername(value) {
   return String(value || "").trim().toLowerCase();
@@ -340,6 +358,7 @@ function clearSessionCookie(response) {
 }
 
 async function getRequestUser(request) {
+  await refreshAuthStore();
   const sessionId = readSignedSessionId(parseCookies(request)[SESSION_COOKIE]);
   if (!sessionId) {
     return null;
@@ -390,10 +409,15 @@ async function appendAuditLog({ request, user, action, space = "", target = "", 
     detail,
     ip: request?.socket?.remoteAddress || "",
   };
+  if (PERSISTENCE.enabled) {
+    await PERSISTENCE.appendAuditLog(record);
+    return;
+  }
   await appendFile(AUDIT_LOG_PATH, `${JSON.stringify(record)}\n`, "utf8");
 }
 
 async function readAuditLogs(limit = 100) {
+  if (PERSISTENCE.enabled) return PERSISTENCE.readAuditLogs(limit);
   try {
     const content = await readFile(AUDIT_LOG_PATH, "utf8");
     return content
@@ -1012,6 +1036,7 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
       plaintextFiles: aiFiles.length - encryptedAiFiles,
       keySource: KNOWLEDGE_KEY_ENV ? "environment" : "server-key-file",
     },
+    persistence: await PERSISTENCE.health(),
     vectorEnabled: VECTOR_ENABLED,
     vectorModel: VECTOR_MODEL,
     vectorIndex: vectorIndexInfo,
@@ -1601,6 +1626,9 @@ function createEmptySession(spaceId, title = "新对话", ownerId = "") {
 
 async function readChatSession(spaceId, sessionId) {
   await ensureKnowledgeBase(spaceId);
+  if (PERSISTENCE.enabled) {
+    return PERSISTENCE.readChatSession(normalizeSpaceId(spaceId), normalizeSessionId(sessionId));
+  }
   const sessionPath = getChatSessionPath(spaceId, sessionId);
   try {
     const content = await readFile(sessionPath, "utf8");
@@ -1630,10 +1658,18 @@ async function writeChatSession(spaceId, session) {
   };
   const sessionPath = path.join(paths.chatDir, `${normalizedSession.id}.json`);
   await writeFile(sessionPath, JSON.stringify(normalizedSession, null, 2), "utf8");
+  await PERSISTENCE.writeChatSession(normalizedSession);
   return normalizedSession;
 }
 
 async function listChatSessions(spaceId = DEFAULT_SPACE_ID, user = null) {
+  if (PERSISTENCE.enabled) {
+    return PERSISTENCE.listChatSessions(
+      normalizeSpaceId(spaceId),
+      user?.id || "",
+      user?.role === "admin"
+    );
+  }
   const paths = await ensureKnowledgeBase(spaceId);
   const entries = await readdir(paths.chatDir, { withFileTypes: true });
   const sessions = [];
@@ -2925,16 +2961,27 @@ function validateChunkedUploadFiles(files) {
 async function writeUploadSession(spaceId, session) {
   const sessionPaths = getUploadSessionPaths(spaceId, session.id);
   await mkdir(sessionPaths.sessionRoot, { recursive: true });
+  const persistedSession = { ...session, updatedAt: new Date().toISOString() };
   await writeFile(
     sessionPaths.sessionPath,
-    JSON.stringify({ ...session, updatedAt: new Date().toISOString() }, null, 2),
+    JSON.stringify(persistedSession, null, 2),
     "utf8"
   );
-  return session;
+  await PERSISTENCE.writeUploadSession(persistedSession);
+  return persistedSession;
 }
 
 async function readUploadSession(spaceId, uploadId) {
   const sessionPaths = getUploadSessionPaths(spaceId, uploadId);
+  if (PERSISTENCE.enabled) {
+    const session = await PERSISTENCE.readUploadSession(normalizeSpaceId(spaceId), uploadId);
+    if (!session) {
+      const error = new Error("没有找到上传会话");
+      error.code = "ENOENT";
+      throw error;
+    }
+    return { session, paths: sessionPaths };
+  }
   const content = await readFile(sessionPaths.sessionPath, "utf8");
   return { session: JSON.parse(content), paths: sessionPaths };
 }
@@ -2976,9 +3023,10 @@ async function getUploadSessionStatus(spaceId, uploadId, user) {
   for (const file of session.files) {
     files.push({ ...file, receivedChunks: await getReceivedChunkIndexes(paths, file) });
   }
-  const job = session.jobId && await pathExists(getImportJobPath(session.space, session.jobId))
-    ? sanitizeImportJob(await readImportJob(session.space, session.jobId))
+  const storedJob = session.jobId
+    ? await readImportJob(session.space, session.jobId).catch(() => null)
     : null;
+  const job = storedJob ? sanitizeImportJob(storedJob) : null;
   return {
     id: session.id,
     space: session.space,
@@ -3138,6 +3186,7 @@ async function cleanupExpiredUploadSessions() {
         const referenceTime = Date.parse(session.completedAt || session.updatedAt || session.createdAt || "");
         if (Number.isFinite(referenceTime) && referenceTime < threshold) {
           await rm(sessionRoot, { recursive: true, force: true });
+          await PERSISTENCE.deleteUploadSession(space.id, session.id || entry.name);
         }
       } catch {
         const info = await stat(sessionRoot);
@@ -3145,9 +3194,13 @@ async function cleanupExpiredUploadSessions() {
       }
     }
   }
+  await PERSISTENCE.deleteExpiredUploadSessions(new Date(threshold).toISOString());
 }
 
 async function countActiveUploadSessions(spaceId) {
+  if (PERSISTENCE.enabled) {
+    return PERSISTENCE.countActiveUploadSessions(normalizeSpaceId(spaceId));
+  }
   const paths = await ensureKnowledgeBase(spaceId);
   let active = 0;
   for (const entry of await readdir(paths.uploadSessionDir, { withFileTypes: true })) {
@@ -3165,6 +3218,15 @@ async function countActiveUploadSessions(spaceId) {
 }
 
 async function readImportJob(spaceId, jobId) {
+  if (PERSISTENCE.enabled) {
+    const job = await PERSISTENCE.readImportJob(normalizeSpaceId(spaceId), jobId);
+    if (!job) {
+      const error = new Error("没有找到入库任务");
+      error.code = "ENOENT";
+      throw error;
+    }
+    return job;
+  }
   const jobPath = getImportJobPath(spaceId, jobId);
   const content = (await readFile(jobPath, "utf8")).replace(/^\uFEFF/, "");
   return JSON.parse(content);
@@ -3178,6 +3240,7 @@ async function writeImportJob(job) {
     updatedAt: new Date().toISOString(),
   };
   await writeFile(jobPath, JSON.stringify(payload, null, 2), "utf8");
+  await PERSISTENCE.writeImportJob(payload);
   return payload;
 }
 
@@ -3190,6 +3253,9 @@ async function patchImportJob(spaceId, jobId, patch) {
 }
 
 async function listImportJobs(spaceId, limit = 30) {
+  if (PERSISTENCE.enabled) {
+    return (await PERSISTENCE.listImportJobs(normalizeSpaceId(spaceId), limit)).map(sanitizeImportJob);
+  }
   const paths = await ensureKnowledgeBase(spaceId);
   const files = await readdir(paths.importJobDir, { withFileTypes: true });
   const jobs = [];
@@ -3217,17 +3283,37 @@ async function resumePendingImportJobs() {
       if (!["queued", "running", "retrying"].includes(job.status)) {
         continue;
       }
+      if (PERSISTENCE.enabled) {
+        const inserted = await PERSISTENCE.ensureTask(space.id, job.id, job.nextRetryAt || "");
+        if (inserted && job.status === "running") {
+          await patchImportJob(space.id, job.id, {
+            status: "queued",
+            phase: "服务重启后等待继续处理",
+            progress: Math.max(10, Math.min(Number(job.progress || 10), 40)),
+          });
+        }
+        continue;
+      }
       await patchImportJob(space.id, job.id, {
         status: "queued",
         phase: "服务重启后等待继续处理",
         progress: Math.max(10, Math.min(Number(job.progress || 10), 40)),
       });
-      enqueueImportJob(space.id, job.id);
+      await enqueueImportJob(space.id, job.id);
     }
   }
 }
 
-function enqueueImportJob(spaceId, jobId) {
+async function enqueueImportJob(spaceId, jobId, delayMs = 0) {
+  if (PERSISTENCE.enabled) {
+    await PERSISTENCE.enqueueTask(spaceId, jobId, delayMs);
+    setTimeout(processImportQueue, Math.min(Math.max(0, delayMs), 1000));
+    return;
+  }
+  if (delayMs > 0) {
+    setTimeout(() => enqueueImportJob(spaceId, jobId).catch(console.error), delayMs);
+    return;
+  }
   const key = `${spaceId}:${jobId}`;
   if (
     activeImportJobs.has(key) ||
@@ -3240,19 +3326,39 @@ function enqueueImportJob(spaceId, jobId) {
 }
 
 async function processImportQueue() {
-  if (activeImportJobs.size >= MAX_CONCURRENT_IMPORT_JOBS) {
+  if (queueWorkerBusy || activeImportJobs.size >= MAX_CONCURRENT_IMPORT_JOBS) {
     return;
   }
-  const next = pendingImportJobs.shift();
+  queueWorkerBusy = true;
+  const next = PERSISTENCE.enabled
+    ? await PERSISTENCE.claimTask().catch((error) => {
+      console.error(`数据库队列认领失败：${error.message}`);
+      return null;
+    })
+    : pendingImportJobs.shift();
   if (!next) {
+    queueWorkerBusy = false;
     return;
   }
 
-  activeImportJobs.add(next.key);
+  const key = next.key || `${next.spaceId}:${next.jobId}`;
+  activeImportJobs.add(key);
+  queueWorkerBusy = false;
+  const heartbeatTimer = PERSISTENCE.enabled
+    ? setInterval(() => PERSISTENCE.heartbeatTask(next.id).catch(() => {}), 30_000)
+    : null;
+  heartbeatTimer?.unref();
   try {
     await runImportJob(next.spaceId, next.jobId);
   } finally {
-    activeImportJobs.delete(next.key);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (PERSISTENCE.enabled) {
+      const job = await readImportJob(next.spaceId, next.jobId).catch(() => null);
+      if (!job || ["completed", "failed"].includes(job.status)) {
+        await PERSISTENCE.finishTask(next.id).catch(() => {});
+      }
+    }
+    activeImportJobs.delete(key);
     setTimeout(processImportQueue, 0);
   }
 }
@@ -3373,7 +3479,7 @@ async function runImportJob(spaceId, jobId) {
         error: message,
         nextRetryAt,
       }).catch(() => {});
-      setTimeout(() => enqueueImportJob(spaceId, jobId), delayMs);
+      await enqueueImportJob(spaceId, jobId, delayMs);
       return;
     }
     await patchImportJob(spaceId, jobId, {
@@ -3411,7 +3517,7 @@ async function createImportJob({ space, project, mode, outputName, saved, id = "
     nextRetryAt: "",
   });
 
-  enqueueImportJob(space, job.id);
+  await enqueueImportJob(space, job.id);
 
   return job;
 }
@@ -3521,10 +3627,8 @@ async function handleCompleteChunkedUpload(request, response, uploadId) {
     const jobId = session.jobId || createImportJobId();
     await writeUploadSession(space, { ...session, status: "assembling", jobId });
     const saved = await assembleChunkedUpload(session, paths);
-    const existingJobPath = getImportJobPath(space, jobId);
-    const job = await pathExists(existingJobPath)
-      ? await readImportJob(space, jobId)
-      : await createImportJob({
+    const existingJob = await readImportJob(space, jobId).catch(() => null);
+    const job = existingJob || await createImportJob({
         space,
         project: session.project,
         mode: session.mode,
@@ -3854,7 +3958,7 @@ async function handleRetryImportJob(request, response, requestUrl) {
       error: "",
       nextRetryAt: "",
     });
-    enqueueImportJob(space, jobId);
+    await enqueueImportJob(space, jobId);
     await appendAuditLog({ request, user, action: "import.retry", space, target: jobId });
     sendJson(response, 200, { ok: true, job: sanitizeImportJob(nextJob) });
   } catch (error) {
@@ -4091,6 +4195,7 @@ async function getOperationsStatus(spaceId) {
   const jobs = await listImportJobs(spaceId, 100);
   const backups = await listBackups(spaceId);
   const trash = await listTrashItems(spaceId);
+  const databaseQueue = await PERSISTENCE.queueStats(spaceId);
   let disk = { freeBytes: null, totalBytes: null, usedPercent: null };
   try {
     const info = await statfs(paths.root);
@@ -4107,8 +4212,8 @@ async function getOperationsStatus(spaceId) {
     memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
     disk,
     queue: {
-      active: activeImportJobs.size,
-      pending: pendingImportJobs.length,
+      active: databaseQueue?.running ?? activeImportJobs.size,
+      pending: databaseQueue?.queued ?? pendingImportJobs.length,
       uploading: await countActiveUploadSessions(spaceId),
       retrying: jobs.filter((job) => job.status === "retrying").length,
       failed: jobs.filter((job) => job.status === "failed").length,
@@ -4117,6 +4222,7 @@ async function getOperationsStatus(spaceId) {
     vector: await readVectorIndexStatus(paths.vectorIndex),
     backup: { latest: backups[0] || null, count: backups.length, autoEnabled: AUTO_BACKUP_ENABLED },
     trash: { count: trash.length, retentionDays: TRASH_RETENTION_DAYS },
+    database: await PERSISTENCE.health(),
   };
 }
 
@@ -4147,6 +4253,67 @@ async function runAutomaticBackups() {
       await appendAuditLog({ request: null, user: null, action: "backup.auto.failed", space: space.id, detail: error.message }).catch(() => {});
     }
   }
+}
+
+async function migrateLegacyDataToPostgres() {
+  if (!PERSISTENCE.enabled) return;
+  const migrationKey = "legacy_files_migrated_v1";
+  if (await PERSISTENCE.getSetting(migrationKey)) return;
+
+  const migrated = { auditLogs: 0, chats: 0, importJobs: 0, uploadSessions: 0 };
+
+  if (await pathExists(AUDIT_LOG_PATH)) {
+    const content = await readFile(AUDIT_LOG_PATH, "utf8");
+    for (const line of content.split(/\r?\n/).filter(Boolean)) {
+      try {
+        await PERSISTENCE.appendAuditLog(JSON.parse(line));
+        migrated.auditLogs += 1;
+      } catch (error) {
+        console.warn(`跳过一条无法迁移的操作日志：${error.message}`);
+      }
+    }
+  }
+
+  for (const space of await listSpaces()) {
+    const paths = await ensureKnowledgeBase(space.id);
+    for (const entry of await readdir(paths.chatDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      try {
+        await PERSISTENCE.writeChatSession(
+          JSON.parse(await readFile(path.join(paths.chatDir, entry.name), "utf8"))
+        );
+        migrated.chats += 1;
+      } catch (error) {
+        console.warn(`跳过无法迁移的对话 ${entry.name}：${error.message}`);
+      }
+    }
+    for (const entry of await readdir(paths.importJobDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      try {
+        await PERSISTENCE.writeImportJob(
+          JSON.parse((await readFile(path.join(paths.importJobDir, entry.name), "utf8")).replace(/^\uFEFF/, ""))
+        );
+        migrated.importJobs += 1;
+      } catch (error) {
+        console.warn(`跳过无法迁移的任务 ${entry.name}：${error.message}`);
+      }
+    }
+    for (const entry of await readdir(paths.uploadSessionDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      try {
+        await PERSISTENCE.writeUploadSession(
+          JSON.parse(await readFile(path.join(paths.uploadSessionDir, entry.name, "session.json"), "utf8"))
+        );
+        migrated.uploadSessions += 1;
+      } catch (error) {
+        console.warn(`跳过无法迁移的上传会话 ${entry.name}：${error.message}`);
+      }
+    }
+  }
+  await PERSISTENCE.setSetting(migrationKey, {
+    completedAt: new Date().toISOString(),
+    ...migrated,
+  });
 }
 
 async function handleVaultConfig(request, response) {
@@ -4225,6 +4392,7 @@ async function handleAuthStatus(request, response) {
 }
 
 async function handleAuthSetup(request, response) {
+  await refreshAuthStore(true);
   if (AUTH_STORE.users.length > 0) {
     sendJson(response, 409, { error: "系统已经完成管理员初始化" });
     return;
@@ -4270,6 +4438,7 @@ async function handleAuthSetup(request, response) {
 }
 
 async function handleLogin(request, response) {
+  await refreshAuthStore(true);
   const payload = await readRequestJson(request, response);
   if (!payload) {
     return;
@@ -4288,6 +4457,7 @@ async function handleLogin(request, response) {
 }
 
 async function handleRegister(request, response) {
+  await refreshAuthStore(true);
   if (AUTH_STORE.users.length === 0) {
     sendJson(response, 409, { error: "请先由部署电脑创建超级管理员" });
     return;
@@ -4342,6 +4512,7 @@ async function handleLogout(request, response) {
   const user = await getRequestUser(request);
   if (sessionId) {
     AUTH_STORE.sessions = AUTH_STORE.sessions.filter((session) => session.id !== sessionId);
+    await PERSISTENCE.deleteAuthSession(sessionId);
     await saveAuthStore(AUTH_STORE);
   }
   clearSessionCookie(response);
@@ -4354,6 +4525,7 @@ async function handleListUsers(request, response) {
     sendForbidden(response, "只有超级管理员可以管理账号");
     return;
   }
+  await refreshAuthStore(true);
   sendJson(response, 200, { ok: true, users: AUTH_STORE.users.map(sanitizeUser) });
 }
 
@@ -4389,6 +4561,7 @@ async function handleSaveUser(request, response) {
   Object.assign(user, { role, spaces, disabled: Boolean(payload.disabled), updatedAt: now });
   if (user.disabled) {
     AUTH_STORE.sessions = AUTH_STORE.sessions.filter((session) => session.userId !== user.id);
+    await PERSISTENCE.deleteUserSessions(user.id);
   }
   await saveAuthStore(AUTH_STORE);
   await appendAuditLog({ request, user: actor, action: "user.update", target: user.username, detail: `${role} / ${spaces.join(", ")}` });
@@ -4793,12 +4966,15 @@ if (KNOWLEDGE_ENCRYPTION_ENABLED) {
   await getKnowledgeEncryptionKey();
 }
 await ensureKnowledgeBase(DEFAULT_SPACE_ID);
+await migrateLegacyDataToPostgres();
 await resumePendingImportJobs();
+setTimeout(processImportQueue, 0);
 await purgeExpiredTrash().catch(() => {});
 await cleanupExpiredUploadSessions().catch(() => {});
 await runAutomaticBackups().catch(() => {});
 setInterval(() => purgeExpiredTrash().catch(() => {}), 6 * 60 * 60 * 1000).unref();
 setInterval(() => cleanupExpiredUploadSessions().catch(() => {}), 6 * 60 * 60 * 1000).unref();
+setInterval(() => processImportQueue().catch(() => {}), 1000).unref();
 if (AUTO_BACKUP_ENABLED) {
   setInterval(() => runAutomaticBackups().catch(() => {}), 60 * 60 * 1000).unref();
 }
@@ -4807,4 +4983,13 @@ server.listen(PORT, () => {
   console.log(`知识库网页已启动：http://localhost:${PORT}`);
   console.log(`知识库总目录：${SPACES_ROOT}`);
   console.log(`知识资料加密：${KNOWLEDGE_ENCRYPTION_ENABLED ? "已启用" : "未启用"}`);
+  console.log(`业务数据存储：${PERSISTENCE.enabled ? "PostgreSQL" : "本地兼容模式"}`);
 });
+
+async function shutdown() {
+  server.close();
+  await PERSISTENCE.close();
+}
+
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
