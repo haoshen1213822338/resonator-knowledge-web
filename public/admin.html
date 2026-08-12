@@ -195,7 +195,7 @@
                 <strong id="raw-file-count">-</strong>
               </div>
               <div class="status-item">
-                <span>DeepSeek</span>
+                <span>多模态 AI</span>
                 <strong id="api-state">检查中</strong>
               </div>
               <div class="status-item">
@@ -209,6 +209,43 @@
             </div>
             <div class="status-footer">
               <span id="kb-path">正在读取本地知识库路径。</span>
+            </div>
+          </article>
+
+          <article class="admin-card operations-card" id="operations-card" aria-labelledby="operations-title">
+            <div class="file-manager-head">
+              <div>
+                <div class="section-label" id="operations-title">系统保障</div>
+                <p class="file-manager-summary">备份、回收站、运行监控和失败恢复。</p>
+              </div>
+              <button type="button" class="ghost-button compact-button" id="refresh-operations">刷新状态</button>
+            </div>
+            <div class="operations-status-grid">
+              <div class="status-item"><span>服务运行</span><strong id="ops-uptime">检查中</strong></div>
+              <div class="status-item"><span>磁盘使用</span><strong id="ops-disk">检查中</strong></div>
+              <div class="status-item"><span>任务队列</span><strong id="ops-queue">检查中</strong></div>
+              <div class="status-item"><span>最近备份</span><strong id="ops-backup">检查中</strong></div>
+            </div>
+            <div class="operations-columns">
+              <section class="operations-section">
+                <div class="operations-section-head">
+                  <div>
+                    <strong>数据备份</strong>
+                    <span id="backup-policy">读取备份策略</span>
+                  </div>
+                  <button type="button" class="primary-button compact-button" id="create-backup">立即备份</button>
+                </div>
+                <div id="backup-list" class="operations-list empty">还没有备份。</div>
+              </section>
+              <section class="operations-section">
+                <div class="operations-section-head">
+                  <div>
+                    <strong>回收站</strong>
+                    <span id="trash-policy">删除文件可在这里恢复</span>
+                  </div>
+                </div>
+                <div id="trash-list" class="operations-list empty">回收站为空。</div>
+              </section>
             </div>
           </article>
 

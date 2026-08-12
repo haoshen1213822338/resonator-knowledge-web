@@ -71,6 +71,17 @@ const resetUserFormButton = document.querySelector("#reset-user-form");
 const auditCard = document.querySelector("#audit-card");
 const auditList = document.querySelector("#audit-list");
 const refreshAudit = document.querySelector("#refresh-audit");
+const operationsCard = document.querySelector("#operations-card");
+const refreshOperations = document.querySelector("#refresh-operations");
+const opsUptime = document.querySelector("#ops-uptime");
+const opsDisk = document.querySelector("#ops-disk");
+const opsQueue = document.querySelector("#ops-queue");
+const opsBackup = document.querySelector("#ops-backup");
+const backupPolicy = document.querySelector("#backup-policy");
+const backupList = document.querySelector("#backup-list");
+const createBackupButton = document.querySelector("#create-backup");
+const trashPolicy = document.querySelector("#trash-policy");
+const trashList = document.querySelector("#trash-list");
 
 const root = document.documentElement;
 let currentSessionId = localStorage.getItem("currentChatSessionId") || "";
@@ -411,6 +422,12 @@ function getAuditActionLabel(action) {
     import: "资料入库",
     "space.create": "新建项目库",
     "file.delete": "删除资料",
+    "file.trash": "移入回收站",
+    "file.restore": "恢复资料",
+    "file.purge": "彻底删除",
+    "backup.create": "创建备份",
+    "backup.restore": "恢复备份",
+    "import.retry": "重试入库",
     "user.create": "创建账号",
     "user.update": "修改账号",
   }[action] || action;
@@ -782,6 +799,7 @@ async function initializeApp() {
   await loadKnowledgeStatus();
   await loadImportJobs();
   await loadManagedFiles();
+  await loadOperations();
   await loadUsers();
   await loadAuditLogs();
   if (chatSessionsBox) {
@@ -1078,6 +1096,7 @@ function getJobStatusText(status) {
     running: "处理中",
     completed: "已完成",
     failed: "失败",
+    retrying: "等待重试",
   };
   return labels[status] || status || "未知";
 }
@@ -1102,6 +1121,9 @@ function renderImportJobs(jobs = []) {
         ? `<span>当前：${escapeHtml(job.currentFile)}</span>`
         : "";
       const detail = job.error || job.stdout || job.uploadDir || "";
+      const retryButton = job.status === "failed"
+        ? `<button type="button" class="ghost-button compact-button" data-job-retry="${escapeHtml(job.id)}">重新执行</button>`
+        : "";
       return `
         <article class="import-job" data-job-id="${escapeHtml(job.id)}">
           <div class="import-job-main">
@@ -1121,6 +1143,7 @@ function renderImportJobs(jobs = []) {
             <div style="width: ${progress}%"></div>
           </div>
           ${detail ? `<p>${escapeHtml(detail).slice(0, 240)}</p>` : ""}
+          ${retryButton ? `<div class="file-row-actions">${retryButton}</div>` : ""}
         </article>
       `;
     })
@@ -1147,7 +1170,7 @@ async function loadImportJobs() {
   }
   renderImportJobs(payload.jobs || []);
   for (const job of payload.jobs || []) {
-    if (job.status === "queued" || job.status === "running") {
+    if (["queued", "running", "retrying"].includes(job.status)) {
       pollImportJob(job.id);
     }
   }
@@ -1242,7 +1265,7 @@ function applyFileManagerCollapsed(collapsed) {
 }
 
 async function deleteManagedFile(relativePath) {
-  const confirmed = window.confirm(`确定删除这个资料文件吗？\n\n${relativePath}`);
+  const confirmed = window.confirm(`确定把这个资料移入回收站吗？\n\n${relativePath}`);
   if (!confirmed) {
     return;
   }
@@ -1260,7 +1283,110 @@ async function deleteManagedFile(relativePath) {
     throw new Error(payload.detail || payload.error || "删除失败");
   }
   await loadManagedFiles();
+  await loadOperations();
   await loadKnowledgeStatus();
+}
+
+async function retryImportJob(jobId) {
+  const response = await apiFetch(`/api/import-jobs/${encodeURIComponent(jobId)}/retry`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ space: getCurrentSpace() }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || payload.error || "任务重试失败");
+  await loadImportJobs();
+  pollImportJob(jobId);
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Number(seconds || 0));
+  if (total < 60) return `${Math.round(total)} 秒`;
+  if (total < 3600) return `${Math.round(total / 60)} 分钟`;
+  if (total < 86400) return `${(total / 3600).toFixed(1)} 小时`;
+  return `${(total / 86400).toFixed(1)} 天`;
+}
+
+function renderOperationsStatus(status) {
+  if (opsUptime) opsUptime.textContent = formatDuration(status.uptimeSeconds);
+  if (opsDisk) opsDisk.textContent = status.disk?.usedPercent == null ? "暂不可用" : `${status.disk.usedPercent}%`;
+  if (opsQueue) opsQueue.textContent = `${status.queue?.active || 0} 运行 · ${status.queue?.pending || 0} 等待 · ${status.queue?.failed || 0} 失败`;
+  if (opsBackup) opsBackup.textContent = status.backup?.latest ? formatLatestUpdate(status.backup.latest.createdAt) : "尚未备份";
+}
+
+function renderBackups(payload) {
+  if (!backupList) return;
+  backupPolicy.textContent = payload.autoEnabled
+    ? `每 ${payload.intervalHours} 小时自动备份 · 保留 ${payload.retentionCount} 份`
+    : `自动备份未启用 · 手动备份保留 ${payload.retentionCount} 份`;
+  const backups = payload.backups || [];
+  if (!backups.length) {
+    backupList.className = "operations-list empty";
+    backupList.textContent = "还没有备份。";
+    return;
+  }
+  backupList.className = "operations-list";
+  backupList.innerHTML = backups.map((item) => `
+    <div class="operations-row">
+      <div><strong>${escapeHtml(formatLatestUpdate(item.createdAt))}</strong><span>${item.files || 0} 个文件 · ${escapeHtml(formatFileSize(item.totalBytes || 0))}</span></div>
+      ${currentUser?.role === "admin" ? `<button type="button" data-backup-restore="${escapeHtml(item.id)}">恢复为新项目库</button>` : ""}
+    </div>
+  `).join("");
+}
+
+function renderTrash(payload) {
+  if (!trashList) return;
+  trashPolicy.textContent = `自动保留 ${payload.retentionDays || 30} 天`;
+  const items = payload.items || [];
+  if (!items.length) {
+    trashList.className = "operations-list empty";
+    trashList.textContent = "回收站为空。";
+    return;
+  }
+  trashList.className = "operations-list";
+  trashList.innerHTML = items.map((item) => `
+    <div class="operations-row">
+      <div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.originalRelativePath)} · ${escapeHtml(formatLatestUpdate(item.deletedAt))}</span></div>
+      <div class="operations-row-actions">
+        <button type="button" data-trash-restore="${escapeHtml(item.id)}">恢复</button>
+        <button type="button" class="text-danger" data-trash-purge="${escapeHtml(item.id)}">彻底删除</button>
+      </div>
+    </div>
+  `).join("");
+}
+
+async function loadOperations() {
+  if (!operationsCard) return;
+  const space = encodeURIComponent(getCurrentSpace());
+  const [statusResponse, backupsResponse, trashResponse] = await Promise.all([
+    apiFetch(`/api/operations-status?space=${space}`),
+    apiFetch(`/api/backups?space=${space}`),
+    apiFetch(`/api/trash?space=${space}`),
+  ]);
+  const [status, backups, trash] = await Promise.all([
+    statusResponse.json(), backupsResponse.json(), trashResponse.json(),
+  ]);
+  if (!statusResponse.ok) throw new Error(status.detail || status.error || "监控状态读取失败");
+  if (!backupsResponse.ok) throw new Error(backups.detail || backups.error || "备份记录读取失败");
+  if (!trashResponse.ok) throw new Error(trash.detail || trash.error || "回收站读取失败");
+  renderOperationsStatus(status);
+  renderBackups(backups);
+  renderTrash(trash);
+}
+
+async function createBackup() {
+  createBackupButton.disabled = true;
+  createBackupButton.textContent = "正在备份...";
+  try {
+    const response = await apiFetch("/api/backups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ space: getCurrentSpace() }) });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || payload.error || "创建备份失败");
+    await loadOperations();
+    await loadAuditLogs();
+  } finally {
+    createBackupButton.disabled = false;
+    createBackupButton.textContent = "立即备份";
+  }
 }
 
 async function pollImportJob(jobId) {
@@ -1299,6 +1425,10 @@ async function pollImportJob(jobId) {
         activeImportPolls.delete(jobId);
         await loadImportJobs();
         return;
+      }
+      if (job.status === "retrying" && job.nextRetryAt) {
+        const seconds = Math.max(0, Math.ceil((Date.parse(job.nextRetryAt) - Date.now()) / 1000));
+        setUploadProgress(job.progress || 20, `${job.phase} · 约 ${seconds} 秒`);
       }
       activeImportPolls.set(jobId, window.setTimeout(poll, 2500));
     } catch (error) {
@@ -1530,6 +1660,7 @@ spaceSelect?.addEventListener("change", async () => {
   await loadKnowledgeStatus();
   await loadImportJobs();
   await loadManagedFiles();
+  await loadOperations();
   resetCurrentChat();
   if (chatSessionsBox) {
     await initializeChatHistory();
@@ -1545,6 +1676,7 @@ kbTargetSpace?.addEventListener("change", async () => {
   await loadKnowledgeStatus();
   await loadImportJobs();
   await loadManagedFiles();
+  await loadOperations();
   resetCurrentChat();
   if (chatSessionsBox) {
     await initializeChatHistory();
@@ -1562,11 +1694,61 @@ userList?.addEventListener("click", (event) => {
   }
 });
 refreshAudit?.addEventListener("click", loadAuditLogs);
+refreshOperations?.addEventListener("click", loadOperations);
+createBackupButton?.addEventListener("click", async () => {
+  try {
+    await createBackup();
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : "创建备份失败");
+  }
+});
+importJobsBox?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-job-retry]");
+  if (!button) return;
+  button.disabled = true;
+  try {
+    await retryImportJob(button.dataset.jobRetry);
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : "任务重试失败");
+  } finally {
+    button.disabled = false;
+  }
+});
+backupList?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-backup-restore]");
+  if (!button || !window.confirm("将备份恢复为一个新的项目库，不会覆盖当前资料。继续吗？")) return;
+  const response = await apiFetch("/api/backups/restore", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: button.dataset.backupRestore }) });
+  const payload = await response.json();
+  if (!response.ok) return window.alert(payload.detail || payload.error || "恢复失败");
+  await loadSpaces(payload.restored?.targetSpace);
+  await loadOperations();
+  await loadAuditLogs();
+});
+trashList?.addEventListener("click", async (event) => {
+  const restoreButton = event.target.closest("[data-trash-restore]");
+  const purgeButton = event.target.closest("[data-trash-purge]");
+  if (!restoreButton && !purgeButton) return;
+  const id = restoreButton?.dataset.trashRestore || purgeButton?.dataset.trashPurge;
+  const isRestore = Boolean(restoreButton);
+  if (!isRestore && !window.confirm("彻底删除后无法恢复，确定继续吗？")) return;
+  const response = await apiFetch(isRestore ? "/api/trash/restore" : "/api/trash", {
+    method: isRestore ? "POST" : "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ space: getCurrentSpace(), id }),
+  });
+  const payload = await response.json();
+  if (!response.ok) return window.alert(payload.detail || payload.error || "操作失败");
+  await loadOperations();
+  await loadManagedFiles();
+  await loadKnowledgeStatus();
+  await loadAuditLogs();
+});
 initVault?.addEventListener("click", initializeVaultPath);
 refreshStatus?.addEventListener("click", async () => {
   await loadKnowledgeStatus();
   await loadImportJobs();
   await loadManagedFiles();
+  await loadOperations();
 });
 rebuildVectorIndexButton?.addEventListener("click", rebuildVectorIndex);
 refreshFiles?.addEventListener("click", loadManagedFiles);

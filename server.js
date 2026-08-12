@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, cp, mkdir, readFile, readdir, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { promisify } from "node:util";
@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const SERVICE_STARTED_AT = Date.now();
 
 await loadEnvFile(path.join(__dirname, ".env"));
 const LOCAL_CONFIG_PATH = path.join(__dirname, "config.local.json");
@@ -29,12 +30,22 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
 const AUTH_STORE_PATH = path.join(DATA_DIR, "auth.json");
 const AUDIT_LOG_PATH = path.join(DATA_DIR, "audit.ndjson");
+const BACKUP_RETENTION_COUNT = Math.max(1, Number(process.env.BACKUP_RETENTION_COUNT || 7));
+const AUTO_BACKUP_ENABLED = ["1", "true", "enabled"].includes(
+  String(process.env.AUTO_BACKUP_ENABLED || "false").toLowerCase()
+);
+const BACKUP_INTERVAL_HOURS = Math.max(1, Number(process.env.BACKUP_INTERVAL_HOURS || 24));
+const IMPORT_MAX_ATTEMPTS = Math.max(1, Number(process.env.IMPORT_MAX_ATTEMPTS || 3));
+const TRASH_RETENTION_DAYS = Math.max(1, Number(process.env.TRASH_RETENTION_DAYS || 30));
 const SESSION_COOKIE = "resonator_session";
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 12;
 const scrypt = promisify(scryptCallback);
 let VAULT_DIR = LOCAL_CONFIG.vaultDir || process.env.VAULT_DIR || path.dirname(KNOWLEDGE_DIR);
 let SPACES_ROOT =
-  LOCAL_CONFIG.spacesRoot || process.env.SPACES_ROOT || path.join(VAULT_DIR, "knowledge_spaces");
+  LOCAL_CONFIG.spacesRoot ||
+  process.env.SPACES_ROOT ||
+  path.join(VAULT_DIR, "knowledge_spaces");
+let BACKUP_DIR = path.resolve(process.env.BACKUP_DIR || path.join(VAULT_DIR, "_knowledge_backups"));
 const DEFAULT_SPACE_ID = process.env.DEFAULT_SPACE_ID || "共振体公司知识库";
 let UPDATE_SCRIPT = process.env.UPDATE_SCRIPT ||
   path.join(VAULT_DIR, "99_系统配置", "scripts", "update_kb.py");
@@ -409,6 +420,9 @@ function setVaultDirectory(vaultDir) {
   if (!process.env.UPDATE_SCRIPT) {
     UPDATE_SCRIPT = path.join(VAULT_DIR, "99_系统配置", "scripts", "update_kb.py");
   }
+  if (!process.env.BACKUP_DIR) {
+    BACKUP_DIR = path.join(VAULT_DIR, "_knowledge_backups");
+  }
 }
 
 function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
@@ -421,6 +435,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
   const chatDir = path.join(systemDir, "chat_sessions");
   const updateLogDir = path.join(systemDir, "update_logs");
   const importJobDir = path.join(systemDir, "import_jobs");
+  const trashDir = path.join(systemDir, "trash");
   const importIndex = path.join(systemDir, "资料入库记录.md");
   const vectorDir = path.join(systemDir, "vector_index");
   const vectorIndex = path.join(vectorDir, "index.json");
@@ -434,6 +449,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
     chatDir,
     updateLogDir,
     importJobDir,
+    trashDir,
     importIndex,
     vectorDir,
     vectorIndex,
@@ -446,6 +462,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
       path.join(systemDir, "scripts"),
       updateLogDir,
       importJobDir,
+      trashDir,
       vectorDir,
     ],
   };
@@ -526,19 +543,24 @@ async function getLatestWriteTime(files) {
 
 function getManagedFileType(filePath, paths) {
   const normalized = path.resolve(filePath);
-  if (normalized.startsWith(path.resolve(paths.knowledgeDir) + path.sep)) {
+  if (isPathInside(paths.knowledgeDir, normalized)) {
     return "ai";
   }
-  if (normalized.startsWith(path.resolve(paths.uploadRoot) + path.sep)) {
+  if (isPathInside(paths.uploadRoot, normalized)) {
     return "upload";
   }
-  if (normalized.startsWith(path.resolve(paths.rawDir) + path.sep)) {
+  if (isPathInside(paths.rawDir, normalized)) {
     return "raw";
   }
-  if (normalized.startsWith(path.resolve(paths.systemDir) + path.sep)) {
+  if (isPathInside(paths.systemDir, normalized)) {
     return "system";
   }
   return "other";
+}
+
+function isPathInside(parentPath, childPath) {
+  const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function getManagedFileTypeLabel(type) {
@@ -565,6 +587,9 @@ async function listManagedFiles(spaceId = DEFAULT_SPACE_ID, { type = "all", quer
   for (const rootDir of roots) {
     const found = await listFilesRecursive(rootDir);
     for (const filePath of found) {
+      if (isPathInside(paths.trashDir, filePath)) {
+        continue;
+      }
       const info = await stat(filePath);
       const relativePath = path.relative(paths.root, filePath);
       const fileType = getManagedFileType(filePath, paths);
@@ -603,7 +628,7 @@ function resolveManagedFilePath(spaceId, relativePath) {
   const paths = getSpacePaths(spaceId);
   const root = path.resolve(paths.root);
   const targetPath = path.resolve(paths.root, String(relativePath || ""));
-  if (!targetPath.startsWith(root + path.sep)) {
+  if (!isPathInside(root, targetPath) || targetPath === root) {
     throw new Error("文件路径不在当前项目库内。");
   }
   return { paths, targetPath };
@@ -619,11 +644,162 @@ async function deleteManagedFile(spaceId, relativePath) {
   if (!info.isFile()) {
     throw new Error("只能删除文件，不能删除文件夹。");
   }
-  await rm(targetPath);
-  return {
-    relativePath: path.relative(paths.root, targetPath),
+  const trashId = `trash_${Date.now()}_${randomUUID().slice(0, 8)}`;
+  const trashItemDir = path.join(paths.trashDir, trashId);
+  const trashedFilePath = path.join(trashItemDir, path.basename(targetPath));
+  const deletedAt = new Date().toISOString();
+  await mkdir(trashItemDir, { recursive: true });
+  await rename(targetPath, trashedFilePath);
+  const record = {
+    id: trashId,
+    space: paths.id,
+    name: path.basename(targetPath),
+    originalRelativePath: path.relative(paths.root, targetPath),
+    trashedRelativePath: path.relative(paths.root, trashedFilePath),
     type: fileType,
+    size: info.size,
+    deletedAt,
   };
+  await writeFile(path.join(trashItemDir, "metadata.json"), JSON.stringify(record, null, 2), "utf8");
+  return {
+    ...record,
+    relativePath: record.originalRelativePath,
+  };
+}
+
+async function listTrashItems(spaceId = DEFAULT_SPACE_ID) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const entries = await readdir(paths.trashDir, { withFileTypes: true });
+  const items = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const content = await readFile(path.join(paths.trashDir, entry.name, "metadata.json"), "utf8");
+      items.push(JSON.parse(content));
+    } catch {
+      // Ignore incomplete trash records; purge can still remove them later.
+    }
+  }
+  return items.sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
+}
+
+async function restoreTrashItem(spaceId, trashId) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const safeId = safePathSegment(trashId);
+  const itemDir = path.join(paths.trashDir, safeId);
+  const record = JSON.parse(await readFile(path.join(itemDir, "metadata.json"), "utf8"));
+  const sourcePath = path.resolve(paths.root, record.trashedRelativePath);
+  const originalPath = path.resolve(paths.root, record.originalRelativePath);
+  if (!isPathInside(paths.trashDir, sourcePath) || sourcePath === path.resolve(paths.trashDir)) {
+    throw new Error("回收站记录无效。");
+  }
+  let targetPath = originalPath;
+  if (await pathExists(targetPath)) {
+    const parsed = path.parse(targetPath);
+    targetPath = path.join(parsed.dir, `${parsed.name}_恢复_${Date.now()}${parsed.ext}`);
+  }
+  await mkdir(path.dirname(targetPath), { recursive: true });
+  await rename(sourcePath, targetPath);
+  await rm(itemDir, { recursive: true, force: true });
+  return { ...record, restoredRelativePath: path.relative(paths.root, targetPath) };
+}
+
+async function purgeTrashItem(spaceId, trashId) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const itemDir = path.resolve(paths.trashDir, safePathSegment(trashId));
+  if (!isPathInside(paths.trashDir, itemDir) || itemDir === path.resolve(paths.trashDir)) {
+    throw new Error("回收站路径无效。");
+  }
+  await rm(itemDir, { recursive: true, force: true });
+}
+
+async function purgeExpiredTrash() {
+  const threshold = Date.now() - TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  for (const space of await listSpaces()) {
+    for (const item of await listTrashItems(space.id)) {
+      if (Date.parse(item.deletedAt) < threshold) {
+        await purgeTrashItem(space.id, item.id);
+      }
+    }
+  }
+}
+
+function backupTimestamp() {
+  return new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "_");
+}
+
+async function listBackups(spaceId = "") {
+  await mkdir(BACKUP_DIR, { recursive: true });
+  const entries = await readdir(BACKUP_DIR, { withFileTypes: true });
+  const backups = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const manifest = JSON.parse(await readFile(path.join(BACKUP_DIR, entry.name, "manifest.json"), "utf8"));
+      if (!spaceId || manifest.space === normalizeSpaceId(spaceId)) backups.push(manifest);
+    } catch {
+      // Ignore incomplete snapshots.
+    }
+  }
+  return backups.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+async function createSpaceBackup(spaceId, reason = "manual", includeSystemData = false) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  await mkdir(BACKUP_DIR, { recursive: true });
+  const id = `backup_${backupTimestamp()}_${safePathSegment(paths.id)}`;
+  const backupRoot = path.join(BACKUP_DIR, id);
+  const snapshotRoot = path.join(backupRoot, "snapshot");
+  const createdAt = new Date().toISOString();
+  await mkdir(backupRoot, { recursive: true });
+  await cp(paths.root, snapshotRoot, {
+    recursive: true,
+    filter: (source) => !isPathInside(paths.trashDir, source),
+  });
+  let systemDataIncluded = false;
+  if (includeSystemData) {
+    const systemDataRoot = path.join(backupRoot, "system_data");
+    await mkdir(systemDataRoot, { recursive: true });
+    for (const source of [AUTH_STORE_PATH, AUDIT_LOG_PATH]) {
+      if (await pathExists(source)) {
+        await cp(source, path.join(systemDataRoot, path.basename(source)));
+        systemDataIncluded = true;
+      }
+    }
+  }
+  const files = await listFilesRecursive(snapshotRoot);
+  let totalBytes = 0;
+  for (const file of files) totalBytes += (await stat(file)).size;
+  const manifest = { id, space: paths.id, createdAt, reason, files: files.length, totalBytes, systemDataIncluded, backupRoot };
+  await writeFile(path.join(backupRoot, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
+
+  const oldBackups = (await listBackups(paths.id)).slice(BACKUP_RETENTION_COUNT);
+  for (const backup of oldBackups) {
+    await rm(path.join(BACKUP_DIR, backup.id), { recursive: true, force: true });
+  }
+  return manifest;
+}
+
+async function restoreSpaceBackup(backupId, requestedName = "") {
+  const safeId = String(backupId || "").trim();
+  if (!safeId || safeId !== path.basename(safeId) || safeId.includes("..")) {
+    throw new Error("备份编号无效。");
+  }
+  const backupRoot = path.resolve(BACKUP_DIR, safeId);
+  if (!isPathInside(BACKUP_DIR, backupRoot) || backupRoot === path.resolve(BACKUP_DIR)) {
+    throw new Error("备份路径无效。");
+  }
+  const manifest = JSON.parse(await readFile(path.join(backupRoot, "manifest.json"), "utf8"));
+  const baseName = requestedName || `${manifest.space}_恢复_${new Date().toISOString().slice(0, 10)}`;
+  let targetSpace = normalizeSpaceId(baseName);
+  let suffix = 1;
+  while (await pathExists(getSpacePaths(targetSpace).root)) {
+    targetSpace = normalizeSpaceId(`${baseName}_${suffix}`);
+    suffix += 1;
+  }
+  await cp(path.join(backupRoot, "snapshot"), getSpacePaths(targetSpace).root, { recursive: true });
+  await ensureKnowledgeBase(targetSpace);
+  return { backup: manifest, targetSpace, targetRoot: getSpacePaths(targetSpace).root };
 }
 
 async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
@@ -2469,12 +2645,15 @@ function sanitizeImportJob(job) {
     logPath: job.logPath,
     stdout: job.stdout || "",
     error: job.error || "",
+    attempts: Number(job.attempts || 0),
+    maxAttempts: Number(job.maxAttempts || IMPORT_MAX_ATTEMPTS),
+    nextRetryAt: job.nextRetryAt || "",
   };
 }
 
 async function readImportJob(spaceId, jobId) {
   const jobPath = getImportJobPath(spaceId, jobId);
-  const content = await readFile(jobPath, "utf8");
+  const content = (await readFile(jobPath, "utf8")).replace(/^\uFEFF/, "");
   return JSON.parse(content);
 }
 
@@ -2506,7 +2685,7 @@ async function listImportJobs(spaceId, limit = 30) {
       continue;
     }
     try {
-      const content = await readFile(path.join(paths.importJobDir, entry.name), "utf8");
+      const content = (await readFile(path.join(paths.importJobDir, entry.name), "utf8")).replace(/^\uFEFF/, "");
       jobs.push(sanitizeImportJob(JSON.parse(content)));
     } catch {
       // Ignore broken job records so the history page remains usable.
@@ -2522,7 +2701,7 @@ async function resumePendingImportJobs() {
   for (const space of spaces) {
     const jobs = await listImportJobs(space.id, 100);
     for (const job of jobs) {
-      if (job.status !== "queued" && job.status !== "running") {
+      if (!["queued", "running", "retrying"].includes(job.status)) {
         continue;
       }
       await patchImportJob(space.id, job.id, {
@@ -2567,10 +2746,16 @@ async function processImportQueue() {
 
 async function runImportJob(spaceId, jobId) {
   try {
+    const previousJob = await readImportJob(spaceId, jobId);
+    const attempts = Number(previousJob.attempts || 0) + 1;
     let job = await patchImportJob(spaceId, jobId, {
       status: "running",
-      phase: "准备解析上传资料",
+      phase: attempts > 1 ? `第 ${attempts} 次尝试：准备解析资料` : "准备解析上传资料",
       progress: 28,
+      attempts,
+      maxAttempts: Number(previousJob.maxAttempts || IMPORT_MAX_ATTEMPTS),
+      nextRetryAt: "",
+      error: "",
       currentFile: "",
       fileIndex: 0,
       totalFiles: 0,
@@ -2661,11 +2846,29 @@ async function runImportJob(spaceId, jobId) {
       ].join("\n"),
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failedJob = await readImportJob(spaceId, jobId).catch(() => null);
+    const attempts = Number(failedJob?.attempts || 1);
+    const maxAttempts = Number(failedJob?.maxAttempts || IMPORT_MAX_ATTEMPTS);
+    if (attempts < maxAttempts) {
+      const delayMs = Math.min(60_000, 5_000 * (2 ** (attempts - 1)));
+      const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+      await patchImportJob(spaceId, jobId, {
+        status: "retrying",
+        phase: `处理失败，${Math.round(delayMs / 1000)} 秒后自动重试`,
+        progress: 20,
+        error: message,
+        nextRetryAt,
+      }).catch(() => {});
+      setTimeout(() => enqueueImportJob(spaceId, jobId), delayMs);
+      return;
+    }
     await patchImportJob(spaceId, jobId, {
       status: "failed",
-      phase: "处理失败",
+      phase: `处理失败，已尝试 ${attempts} 次`,
       progress: 100,
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
+      nextRetryAt: "",
     }).catch(() => {});
   }
 }
@@ -2689,6 +2892,9 @@ async function createImportJob({ space, project, mode, outputName, saved }) {
     logPath: "",
     stdout: "",
     error: "",
+    attempts: 0,
+    maxAttempts: IMPORT_MAX_ATTEMPTS,
+    nextRetryAt: "",
   });
 
   enqueueImportJob(space, job.id);
@@ -2955,6 +3161,43 @@ async function handleGetImportJob(requestUrl, response) {
   }
 }
 
+async function handleRetryImportJob(request, response, requestUrl) {
+  const user = request.authUser;
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  const jobId = decodeURIComponent(requestUrl.pathname.split("/").at(-2) || "");
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response, "只有项目资料管理员可以重试入库任务");
+    return;
+  }
+  try {
+    const job = await readImportJob(space, jobId);
+    if (!["failed", "retrying"].includes(job.status)) {
+      sendJson(response, 409, { error: "只有失败或等待重试的任务可以重新执行" });
+      return;
+    }
+    for (const filePath of job.savedFiles || []) {
+      if (!(await pathExists(filePath))) {
+        throw new Error(`原始文件已不存在：${filePath}`);
+      }
+    }
+    const nextJob = await patchImportJob(space, jobId, {
+      status: "queued",
+      phase: "已手动重新提交",
+      progress: 20,
+      attempts: 0,
+      error: "",
+      nextRetryAt: "",
+    });
+    enqueueImportJob(space, jobId);
+    await appendAuditLog({ request, user, action: "import.retry", space, target: jobId });
+    sendJson(response, 200, { ok: true, job: sanitizeImportJob(nextJob) });
+  } catch (error) {
+    sendJson(response, 500, { error: "重新执行入库任务失败", detail: error.message });
+  }
+}
+
 async function handleListManagedFiles(requestUrl, response) {
   const user = response.authUser;
   const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
@@ -2997,7 +3240,7 @@ async function handleDeleteManagedFile(request, response) {
 
   try {
     const deleted = await deleteManagedFile(space, relativePath);
-    await appendAuditLog({ request, user, action: "file.delete", space, target: relativePath });
+    await appendAuditLog({ request, user, action: "file.trash", space, target: relativePath, detail: deleted.id });
     sendJson(response, 200, {
       ok: true,
       space,
@@ -3008,6 +3251,167 @@ async function handleDeleteManagedFile(request, response) {
       error: "删除资料失败",
       detail: error instanceof Error ? error.message : String(error),
     });
+  }
+}
+
+async function handleListTrash(requestUrl, response) {
+  const user = response.authUser;
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
+  sendJson(response, 200, { ok: true, space, retentionDays: TRASH_RETENTION_DAYS, items: await listTrashItems(space) });
+}
+
+async function handleRestoreTrash(request, response) {
+  const user = request.authUser;
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
+  try {
+    const restored = await restoreTrashItem(space, payload.id);
+    await appendAuditLog({ request, user, action: "file.restore", space, target: restored.restoredRelativePath });
+    sendJson(response, 200, { ok: true, restored });
+  } catch (error) {
+    sendJson(response, 500, { error: "恢复资料失败", detail: error.message });
+  }
+}
+
+async function handlePurgeTrash(request, response) {
+  const user = request.authUser;
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
+  try {
+    await purgeTrashItem(space, payload.id);
+    await appendAuditLog({ request, user, action: "file.purge", space, target: payload.id });
+    sendJson(response, 200, { ok: true });
+  } catch (error) {
+    sendJson(response, 500, { error: "彻底删除失败", detail: error.message });
+  }
+}
+
+async function handleListBackups(requestUrl, response) {
+  const user = response.authUser;
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
+  sendJson(response, 200, {
+    ok: true,
+    space,
+    backupDir: BACKUP_DIR,
+    autoEnabled: AUTO_BACKUP_ENABLED,
+    intervalHours: BACKUP_INTERVAL_HOURS,
+    retentionCount: BACKUP_RETENTION_COUNT,
+    backups: await listBackups(space),
+  });
+}
+
+async function handleCreateBackup(request, response) {
+  const user = request.authUser;
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
+  try {
+    const backup = await createSpaceBackup(space, "manual", user.role === "admin");
+    await appendAuditLog({ request, user, action: "backup.create", space, target: backup.id, detail: `${backup.files} files / ${backup.totalBytes} bytes` });
+    sendJson(response, 200, { ok: true, backup });
+  } catch (error) {
+    sendJson(response, 500, { error: "创建备份失败", detail: error.message });
+  }
+}
+
+async function handleRestoreBackup(request, response) {
+  const user = request.authUser;
+  if (user?.role !== "admin") {
+    sendForbidden(response, "只有超级管理员可以从备份创建恢复库");
+    return;
+  }
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  try {
+    const restored = await restoreSpaceBackup(payload.id, payload.name);
+    await appendAuditLog({ request, user, action: "backup.restore", space: restored.targetSpace, target: payload.id });
+    sendJson(response, 200, { ok: true, restored, spaces: await listSpaces() });
+  } catch (error) {
+    sendJson(response, 500, { error: "恢复备份失败", detail: error.message });
+  }
+}
+
+async function getOperationsStatus(spaceId) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  const jobs = await listImportJobs(spaceId, 100);
+  const backups = await listBackups(spaceId);
+  const trash = await listTrashItems(spaceId);
+  let disk = { freeBytes: null, totalBytes: null, usedPercent: null };
+  try {
+    const info = await statfs(paths.root);
+    const totalBytes = Number(info.blocks) * Number(info.bsize);
+    const freeBytes = Number(info.bavail) * Number(info.bsize);
+    disk = { freeBytes, totalBytes, usedPercent: totalBytes ? Math.round((1 - freeBytes / totalBytes) * 1000) / 10 : null };
+  } catch {
+    // Disk metrics are optional on older Node versions/filesystems.
+  }
+  return {
+    ok: true,
+    checkedAt: new Date().toISOString(),
+    uptimeSeconds: Math.round((Date.now() - SERVICE_STARTED_AT) / 1000),
+    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    disk,
+    queue: {
+      active: activeImportJobs.size,
+      pending: pendingImportJobs.length,
+      retrying: jobs.filter((job) => job.status === "retrying").length,
+      failed: jobs.filter((job) => job.status === "failed").length,
+    },
+    ai: { provider: AI_PROVIDER, model: AI_MODEL, visionModel: AI_VISION_MODEL, configured: Boolean(AI_API_KEY) },
+    vector: await readVectorIndexStatus(paths.vectorIndex),
+    backup: { latest: backups[0] || null, count: backups.length, autoEnabled: AUTO_BACKUP_ENABLED },
+    trash: { count: trash.length, retentionDays: TRASH_RETENTION_DAYS },
+  };
+}
+
+async function handleOperationsStatus(requestUrl, response) {
+  const user = response.authUser;
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
+  try {
+    sendJson(response, 200, await getOperationsStatus(space));
+  } catch (error) {
+    sendJson(response, 500, { error: "读取系统监控状态失败", detail: error.message });
+  }
+}
+
+async function runAutomaticBackups() {
+  if (!AUTO_BACKUP_ENABLED) return;
+  for (const space of await listSpaces()) {
+    try {
+      const latest = (await listBackups(space.id))[0];
+      const ageMs = latest ? Date.now() - Date.parse(latest.createdAt) : Infinity;
+      if (ageMs < BACKUP_INTERVAL_HOURS * 60 * 60 * 1000) continue;
+      const backup = await createSpaceBackup(space.id, "automatic", true);
+      await appendAuditLog({ request: null, user: null, action: "backup.auto", space: space.id, target: backup.id });
+    } catch (error) {
+      await appendAuditLog({ request: null, user: null, action: "backup.auto.failed", space: space.id, detail: error.message }).catch(() => {});
+    }
   }
 }
 
@@ -3443,6 +3847,11 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && /^\/api\/import-jobs\/[^/]+\/retry$/.test(requestUrl.pathname)) {
+    await handleRetryImportJob(request, response, requestUrl);
+    return;
+  }
+
   if (request.method === "GET" && requestUrl.pathname.startsWith("/api/import-jobs/")) {
     await handleGetImportJob(requestUrl, response);
     return;
@@ -3455,6 +3864,41 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "DELETE" && requestUrl.pathname === "/api/files") {
     await handleDeleteManagedFile(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/trash") {
+    await handleListTrash(requestUrl, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/trash/restore") {
+    await handleRestoreTrash(request, response);
+    return;
+  }
+
+  if (request.method === "DELETE" && requestUrl.pathname === "/api/trash") {
+    await handlePurgeTrash(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/backups") {
+    await handleListBackups(requestUrl, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/backups") {
+    await handleCreateBackup(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/backups/restore") {
+    await handleRestoreBackup(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/operations-status") {
+    await handleOperationsStatus(requestUrl, response);
     return;
   }
 
@@ -3568,6 +4012,12 @@ const server = createServer(async (request, response) => {
 
 await ensureKnowledgeBase(DEFAULT_SPACE_ID);
 await resumePendingImportJobs();
+await purgeExpiredTrash().catch(() => {});
+await runAutomaticBackups().catch(() => {});
+setInterval(() => purgeExpiredTrash().catch(() => {}), 6 * 60 * 60 * 1000).unref();
+if (AUTO_BACKUP_ENABLED) {
+  setInterval(() => runAutomaticBackups().catch(() => {}), 60 * 60 * 1000).unref();
+}
 
 server.listen(PORT, () => {
   console.log(`知识库网页已启动：http://localhost:${PORT}`);
