@@ -431,6 +431,8 @@ function getAuditActionLabel(action) {
     "backup.create": "创建备份",
     "backup.restore": "恢复备份",
     "encryption.migrate": "加密已有资料",
+    "upload.init": "开始分片上传",
+    "upload.complete": "完成分片上传",
     "import.retry": "重试入库",
     "user.create": "创建账号",
     "user.update": "修改账号",
@@ -1359,7 +1361,7 @@ function formatDuration(seconds) {
 function renderOperationsStatus(status) {
   if (opsUptime) opsUptime.textContent = formatDuration(status.uptimeSeconds);
   if (opsDisk) opsDisk.textContent = status.disk?.usedPercent == null ? "暂不可用" : `${status.disk.usedPercent}%`;
-  if (opsQueue) opsQueue.textContent = `${status.queue?.active || 0} 运行 · ${status.queue?.pending || 0} 等待 · ${status.queue?.failed || 0} 失败`;
+  if (opsQueue) opsQueue.textContent = `${status.queue?.uploading || 0} 上传 · ${status.queue?.active || 0} 运行 · ${status.queue?.pending || 0} 等待 · ${status.queue?.failed || 0} 失败`;
   if (opsBackup) opsBackup.textContent = status.backup?.latest ? formatLatestUpdate(status.backup.latest.createdAt) : "尚未备份";
 }
 
@@ -1454,8 +1456,11 @@ async function pollImportJob(jobId) {
       }
 
       const job = payload.job;
+      const displayProgress = job.uploadId
+        ? 60 + Math.max(0, Math.min(100, Number(job.progress || 0))) * 0.4
+        : job.progress || 0;
       setUploadProgress(
-        job.progress || 0,
+        displayProgress,
         job.currentFile
           ? `${job.phase || getJobStatusText(job.status)} · ${job.currentFile}`
           : job.phase || getJobStatusText(job.status)
@@ -1477,7 +1482,7 @@ async function pollImportJob(jobId) {
       }
       if (job.status === "retrying" && job.nextRetryAt) {
         const seconds = Math.max(0, Math.ceil((Date.parse(job.nextRetryAt) - Date.now()) / 1000));
-        setUploadProgress(job.progress || 20, `${job.phase} · 约 ${seconds} 秒`);
+        setUploadProgress(displayProgress, `${job.phase} · 约 ${seconds} 秒`);
       }
       activeImportPolls.set(jobId, window.setTimeout(poll, 2500));
     } catch (error) {
@@ -1520,51 +1525,154 @@ function resetUploadProgress() {
   kbProgressBar.style.width = "0%";
 }
 
-function sendImportRequest(formData, { dryRun, hasVideo }) {
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open("POST", "/api/import-kb");
-    request.upload.onprogress = (event) => {
-      if (!event.lengthComputable) {
-        return;
-      }
-      const uploadPercent = (event.loaded / event.total) * 100;
-      if (dryRun) {
-        setUploadProgress(uploadPercent, "正在检查文件信息");
-      } else {
-        setUploadProgress(Math.min(55, uploadPercent * 0.55), "正在上传原始文件");
-      }
-    };
-    request.upload.onload = () => {
-      if (dryRun) {
-        setUploadProgress(90, "正在生成预检查结果");
-      } else {
-        setUploadProgress(hasVideo ? 68 : 72, hasVideo ? "正在解析视频内容" : "正在解析文件内容");
-      }
-    };
-    request.onload = () => {
-      let payload = {};
-      try {
-        payload = JSON.parse(request.responseText || "{}");
-      } catch {
-        reject(new Error("后端返回了无法读取的结果。"));
-        return;
-      }
-      if (request.status < 200 || request.status >= 300) {
-        reject(new Error(payload.detail || payload.error || "更新失败"));
-        return;
-      }
-      if (payload.jobId && !dryRun) {
-        setUploadProgress(payload.job?.progress || 60, "后台任务已提交");
-      } else {
-        setUploadProgress(100, dryRun ? "预检查完成" : "已写入知识库");
-      }
-      resolve(payload);
-    };
-    request.onerror = () => reject(new Error("网络连接中断，上传没有完成。"));
-    request.onabort = () => reject(new Error("上传已取消。"));
-    request.send(formData);
+const PENDING_UPLOAD_STORAGE_KEY = "resonatorPendingUpload";
+
+function buildUploadFingerprint({ space, project, mode, outputName, files }) {
+  return JSON.stringify({
+    space,
+    project,
+    mode,
+    outputName,
+    files: files.map((file) => [file.name, file.size, file.lastModified]),
   });
+}
+
+function readPendingUpload() {
+  try {
+    return JSON.parse(localStorage.getItem(PENDING_UPLOAD_STORAGE_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+async function getUploadSession(uploadId, space) {
+  const response = await apiFetch(
+    `/api/uploads/${encodeURIComponent(uploadId)}?space=${encodeURIComponent(space)}`
+  );
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || payload.error || "上传会话读取失败");
+  return payload.upload;
+}
+
+async function getOrCreateUploadSession(metadata) {
+  const fingerprint = buildUploadFingerprint(metadata);
+  const pending = readPendingUpload();
+  if (pending?.id && pending.fingerprint === fingerprint && pending.space === metadata.space) {
+    try {
+      const upload = await getUploadSession(pending.id, metadata.space);
+      setUploadProgress(4, upload.status === "completed" ? "恢复已完成的上传任务" : "找到未完成上传，准备继续");
+      return upload;
+    } catch {
+      localStorage.removeItem(PENDING_UPLOAD_STORAGE_KEY);
+    }
+  }
+
+  const response = await apiFetch("/api/uploads/init", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      space: metadata.space,
+      project: metadata.project,
+      mode: metadata.mode,
+      outputName: metadata.outputName,
+      files: metadata.files.map((file) => ({
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        lastModified: file.lastModified,
+      })),
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || payload.error || "无法创建上传会话");
+  localStorage.setItem(PENDING_UPLOAD_STORAGE_KEY, JSON.stringify({
+    id: payload.upload.id,
+    space: metadata.space,
+    fingerprint,
+  }));
+  return payload.upload;
+}
+
+function getChunkByteSize(fileMeta, chunkIndex, chunkSize) {
+  return Math.min(chunkSize, fileMeta.size - chunkIndex * chunkSize);
+}
+
+async function uploadChunkWithRetry({ upload, fileMeta, file, chunkIndex }) {
+  const start = chunkIndex * upload.chunkSize;
+  const chunk = file.slice(start, Math.min(file.size, start + upload.chunkSize));
+  let latestError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await apiFetch(
+        `/api/uploads/${encodeURIComponent(upload.id)}/files/${fileMeta.index}/chunks/${chunkIndex}`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Knowledge-Space": encodeURIComponent(upload.space),
+          },
+          body: chunk,
+        }
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || payload.error || "分片上传失败");
+      return;
+    } catch (error) {
+      latestError = error;
+      if (attempt < 3) await new Promise((resolve) => window.setTimeout(resolve, 800 * attempt));
+    }
+  }
+  throw latestError || new Error("分片上传失败");
+}
+
+async function sendChunkedImportRequest({ targetSpace, project, mode, outputName, files }) {
+  const upload = await getOrCreateUploadSession({
+    space: targetSpace,
+    project,
+    mode,
+    outputName,
+    files,
+  });
+  if (upload.status !== "completed") {
+    const tasks = [];
+    let uploadedBytes = 0;
+    const totalBytes = upload.files.reduce((total, file) => total + file.size, 0);
+    for (const fileMeta of upload.files) {
+      const received = new Set(fileMeta.receivedChunks || []);
+      for (const chunkIndex of received) {
+        uploadedBytes += getChunkByteSize(fileMeta, chunkIndex, upload.chunkSize);
+      }
+      for (let chunkIndex = 0; chunkIndex < fileMeta.totalChunks; chunkIndex += 1) {
+        if (!received.has(chunkIndex)) tasks.push({ fileMeta, chunkIndex });
+      }
+    }
+
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < tasks.length) {
+        const task = tasks[cursor];
+        cursor += 1;
+        const file = files[task.fileMeta.index];
+        await uploadChunkWithRetry({ upload, file, ...task });
+        uploadedBytes += getChunkByteSize(task.fileMeta, task.chunkIndex, upload.chunkSize);
+        const percent = totalBytes ? 5 + (uploadedBytes / totalBytes) * 50 : 55;
+        setUploadProgress(percent, `正在上传 ${task.fileMeta.name} · ${task.chunkIndex + 1}/${task.fileMeta.totalChunks}`);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, Math.max(1, tasks.length)) }, worker));
+  }
+
+  setUploadProgress(57, "文件分片已齐全，正在合并并校验");
+  const response = await apiFetch(`/api/uploads/${encodeURIComponent(upload.id)}/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ space: targetSpace }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || payload.error || "文件合并失败");
+  localStorage.removeItem(PENDING_UPLOAD_STORAGE_KEY);
+  setUploadProgress(60, "上传完成，后台开始解析资料");
+  return payload;
 }
 
 async function sendPrecheckRequest({ targetSpace, project, mode, files }) {
@@ -1635,17 +1743,13 @@ async function runKnowledgeUpdate(dryRun) {
       return;
     }
 
-    const formData = new FormData();
-    formData.append("space", targetSpace);
-    formData.append("project", kbProject.value.trim());
-    formData.append("mode", kbMode.value);
-    formData.append("outputName", kbOutputName.value.trim());
-    formData.append("dryRun", String(dryRun));
-    for (const file of kbFile.files) {
-      formData.append("files", file);
-    }
-
-    const payload = await sendImportRequest(formData, { dryRun, hasVideo });
+    const payload = await sendChunkedImportRequest({
+      targetSpace,
+      project: kbProject.value.trim(),
+      mode: kbMode.value,
+      outputName: kbOutputName.value.trim(),
+      files: selectedFiles,
+    });
 
     kbStatus.className = "update-status success";
     const saved = payload.savedFiles?.length

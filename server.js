@@ -58,6 +58,14 @@ const AUTO_BACKUP_ENABLED = ["1", "true", "enabled"].includes(
 const BACKUP_INTERVAL_HOURS = Math.max(1, Number(process.env.BACKUP_INTERVAL_HOURS || 24));
 const IMPORT_MAX_ATTEMPTS = Math.max(1, Number(process.env.IMPORT_MAX_ATTEMPTS || 3));
 const TRASH_RETENTION_DAYS = Math.max(1, Number(process.env.TRASH_RETENTION_DAYS || 30));
+const UPLOAD_CHUNK_SIZE = Math.min(
+  64 * 1024 * 1024,
+  Math.max(1024 * 1024, Number(process.env.UPLOAD_CHUNK_SIZE || 8 * 1024 * 1024))
+);
+const UPLOAD_SESSION_RETENTION_HOURS = Math.max(
+  24,
+  Number(process.env.UPLOAD_SESSION_RETENTION_HOURS || 72)
+);
 const SESSION_COOKIE = "resonator_session";
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 12;
 const scrypt = promisify(scryptCallback);
@@ -572,6 +580,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
   const chatDir = path.join(systemDir, "chat_sessions");
   const updateLogDir = path.join(systemDir, "update_logs");
   const importJobDir = path.join(systemDir, "import_jobs");
+  const uploadSessionDir = path.join(systemDir, "upload_sessions");
   const trashDir = path.join(systemDir, "trash");
   const importIndex = path.join(systemDir, "资料入库记录.md");
   const vectorDir = path.join(systemDir, "vector_index");
@@ -586,6 +595,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
     chatDir,
     updateLogDir,
     importJobDir,
+    uploadSessionDir,
     trashDir,
     importIndex,
     vectorDir,
@@ -599,6 +609,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
       path.join(systemDir, "scripts"),
       updateLogDir,
       importJobDir,
+      uploadSessionDir,
       trashDir,
       vectorDir,
     ],
@@ -725,6 +736,9 @@ async function listManagedFiles(spaceId = DEFAULT_SPACE_ID, { type = "all", quer
     const found = await listFilesRecursive(rootDir);
     for (const filePath of found) {
       if (isPathInside(paths.trashDir, filePath)) {
+        continue;
+      }
+      if (isPathInside(paths.uploadSessionDir, filePath)) {
         continue;
       }
       const info = await stat(filePath);
@@ -894,7 +908,9 @@ async function createSpaceBackup(spaceId, reason = "manual", includeSystemData =
   await mkdir(backupRoot, { recursive: true });
   await cp(paths.root, snapshotRoot, {
     recursive: true,
-    filter: (source) => !isPathInside(paths.trashDir, source),
+    filter: (source) =>
+      !isPathInside(paths.trashDir, source) &&
+      !isPathInside(paths.uploadSessionDir, source),
   });
   let systemDataIncluded = false;
   if (includeSystemData) {
@@ -2641,9 +2657,14 @@ async function handleUpdateKnowledge(request, response) {
   }
 }
 
-async function readRequestBuffer(request) {
+async function readRequestBuffer(request, maxBytes = Infinity) {
   const chunks = [];
+  let totalBytes = 0;
   for await (const chunk of request) {
+    totalBytes += chunk.length;
+    if (totalBytes > maxBytes) {
+      throw new Error("上传分片超过服务器约定大小");
+    }
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
@@ -2840,6 +2861,234 @@ async function saveUploadedFiles(spaceId, project, files) {
   return { uploadDir, relativeInput, savedFiles, spaceRoot: paths.root };
 }
 
+function createUploadSessionId() {
+  return `upload_${Date.now()}_${randomUUID().slice(0, 12)}`;
+}
+
+function getUploadSessionPaths(spaceId, uploadId) {
+  const paths = getSpacePaths(spaceId);
+  const safeId = safePathSegment(uploadId);
+  if (!uploadId || safeId !== uploadId || !uploadId.startsWith("upload_")) {
+    throw new Error("上传会话编号无效");
+  }
+  const root = path.resolve(paths.uploadSessionDir, safeId);
+  if (!isPathInside(paths.uploadSessionDir, root)) {
+    throw new Error("上传会话路径无效");
+  }
+  return {
+    ...paths,
+    sessionRoot: root,
+    sessionPath: path.join(root, "session.json"),
+    chunksRoot: path.join(root, "chunks"),
+  };
+}
+
+function createUniqueUploadNames(files) {
+  const usedNames = new Set();
+  return files.map((file) => {
+    const initialName = getSafeUploadFileName(file.name || file.fileName);
+    const parsed = path.parse(initialName);
+    let safeName = initialName;
+    let suffix = 2;
+    while (usedNames.has(safeName.toLowerCase())) {
+      safeName = `${parsed.name}_${suffix}${parsed.ext}`;
+      suffix += 1;
+    }
+    usedNames.add(safeName.toLowerCase());
+    return safeName;
+  });
+}
+
+function validateChunkedUploadFiles(files) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error("请先选择要上传的资料文件");
+  }
+  const safeNames = createUniqueUploadNames(files);
+  return files.map((file, index) => {
+    validateUploadMetadata(file.name || file.fileName);
+    const size = Number(file.size);
+    if (!Number.isSafeInteger(size) || size <= 0) {
+      throw new Error(`文件大小无效：${file.name || file.fileName}`);
+    }
+    return {
+      index,
+      name: String(file.name || file.fileName),
+      safeName: safeNames[index],
+      size,
+      type: String(file.type || "application/octet-stream"),
+      lastModified: Number(file.lastModified || 0),
+      totalChunks: Math.ceil(size / UPLOAD_CHUNK_SIZE),
+    };
+  });
+}
+
+async function writeUploadSession(spaceId, session) {
+  const sessionPaths = getUploadSessionPaths(spaceId, session.id);
+  await mkdir(sessionPaths.sessionRoot, { recursive: true });
+  await writeFile(
+    sessionPaths.sessionPath,
+    JSON.stringify({ ...session, updatedAt: new Date().toISOString() }, null, 2),
+    "utf8"
+  );
+  return session;
+}
+
+async function readUploadSession(spaceId, uploadId) {
+  const sessionPaths = getUploadSessionPaths(spaceId, uploadId);
+  const content = await readFile(sessionPaths.sessionPath, "utf8");
+  return { session: JSON.parse(content), paths: sessionPaths };
+}
+
+function assertUploadSessionAccess(user, session) {
+  if (!userCanManageSpace(user, session.space)) {
+    throw new Error("你没有管理这个项目库的权限");
+  }
+  if (user.role !== "admin" && session.ownerId !== user.id) {
+    throw new Error("这个上传会话不属于当前账号");
+  }
+}
+
+function getExpectedChunkSize(file, chunkIndex) {
+  const offset = chunkIndex * UPLOAD_CHUNK_SIZE;
+  return Math.min(UPLOAD_CHUNK_SIZE, file.size - offset);
+}
+
+async function getReceivedChunkIndexes(paths, file) {
+  const fileChunkDir = path.join(paths.chunksRoot, String(file.index));
+  if (!(await pathExists(fileChunkDir))) return [];
+  const entries = await readdir(fileChunkDir, { withFileTypes: true });
+  const received = [];
+  for (const entry of entries) {
+    const match = entry.isFile() && entry.name.match(/^(\d+)\.part$/);
+    if (!match) continue;
+    const chunkIndex = Number(match[1]);
+    if (chunkIndex < 0 || chunkIndex >= file.totalChunks) continue;
+    const info = await stat(path.join(fileChunkDir, entry.name));
+    if (info.size === getExpectedChunkSize(file, chunkIndex)) received.push(chunkIndex);
+  }
+  return received.sort((a, b) => a - b);
+}
+
+async function getUploadSessionStatus(spaceId, uploadId, user) {
+  const { session, paths } = await readUploadSession(spaceId, uploadId);
+  assertUploadSessionAccess(user, session);
+  const files = [];
+  for (const file of session.files) {
+    files.push({ ...file, receivedChunks: await getReceivedChunkIndexes(paths, file) });
+  }
+  const job = session.jobId && await pathExists(getImportJobPath(session.space, session.jobId))
+    ? sanitizeImportJob(await readImportJob(session.space, session.jobId))
+    : null;
+  return {
+    id: session.id,
+    space: session.space,
+    project: session.project,
+    mode: session.mode,
+    outputName: session.outputName,
+    status: session.status || "uploading",
+    chunkSize: session.chunkSize,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    uploadDir: session.uploadDir,
+    jobId: session.jobId || "",
+    job,
+    files,
+  };
+}
+
+async function createChunkedUploadSession({ user, space, project, mode, outputName, files }) {
+  const paths = await ensureKnowledgeBase(space);
+  const id = createUploadSessionId();
+  const createdAt = new Date().toISOString();
+  const timestamp = createdAt.replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "_");
+  const session = {
+    id,
+    ownerId: user.id,
+    space,
+    project,
+    mode,
+    outputName,
+    status: "uploading",
+    chunkSize: UPLOAD_CHUNK_SIZE,
+    createdAt,
+    updatedAt: createdAt,
+    uploadDir: path.join(paths.uploadRoot, `${timestamp}_${safePathSegment(project)}`),
+    files: validateChunkedUploadFiles(files),
+    jobId: "",
+  };
+  await writeUploadSession(space, session);
+  return getUploadSessionStatus(space, id, user);
+}
+
+async function saveUploadChunk({ request, user, space, uploadId, fileIndex, chunkIndex }) {
+  const { session, paths } = await readUploadSession(space, uploadId);
+  assertUploadSessionAccess(user, session);
+  if (session.status === "completed") return { alreadyCompleted: true, session };
+  const file = session.files.find((item) => item.index === fileIndex);
+  if (!file || chunkIndex < 0 || chunkIndex >= file.totalChunks) {
+    throw new Error("上传分片位置无效");
+  }
+  const expectedSize = getExpectedChunkSize(file, chunkIndex);
+  const declaredSize = Number(request.headers["content-length"] || expectedSize);
+  if (declaredSize !== expectedSize) {
+    throw new Error(`分片大小不正确，应为 ${expectedSize} 字节`);
+  }
+  const fileChunkDir = path.join(paths.chunksRoot, String(file.index));
+  const targetPath = path.join(fileChunkDir, `${chunkIndex}.part`);
+  await mkdir(fileChunkDir, { recursive: true });
+  if (await pathExists(targetPath)) {
+    const info = await stat(targetPath);
+    if (info.size === expectedSize) return { received: true, duplicate: true };
+  }
+  const content = await readRequestBuffer(request, expectedSize);
+  if (content.length !== expectedSize) {
+    throw new Error(`分片接收不完整，应为 ${expectedSize} 字节，实际 ${content.length} 字节`);
+  }
+  const temporaryPath = `${targetPath}.${randomUUID()}.tmp`;
+  await writeFile(temporaryPath, content, { mode: 0o600 });
+  await rm(targetPath, { force: true });
+  await rename(temporaryPath, targetPath);
+  return { received: true, duplicate: false };
+}
+
+async function assembleChunkedUpload(session, paths) {
+  await mkdir(session.uploadDir, { recursive: true });
+  const savedFiles = [];
+  for (const file of session.files) {
+    const received = await getReceivedChunkIndexes(paths, file);
+    if (received.length !== file.totalChunks) {
+      throw new Error(`${file.name} 尚有 ${file.totalChunks - received.length} 个分片未上传`);
+    }
+    const targetPath = path.join(session.uploadDir, file.safeName);
+    if (await pathExists(targetPath) && (await stat(targetPath)).size === file.size) {
+      savedFiles.push(targetPath);
+      continue;
+    }
+    const temporaryPath = `${targetPath}.${session.id}.assembling`;
+    await writeFile(temporaryPath, Buffer.alloc(0), { mode: 0o600 });
+    try {
+      for (let chunkIndex = 0; chunkIndex < file.totalChunks; chunkIndex += 1) {
+        const chunkPath = path.join(paths.chunksRoot, String(file.index), `${chunkIndex}.part`);
+        await appendFile(temporaryPath, await readFile(chunkPath));
+      }
+      if ((await stat(temporaryPath)).size !== file.size) {
+        throw new Error(`${file.name} 合并后的大小不正确`);
+      }
+      await rm(targetPath, { force: true });
+      await rename(temporaryPath, targetPath);
+    } finally {
+      await rm(temporaryPath, { force: true }).catch(() => {});
+    }
+    savedFiles.push(targetPath);
+  }
+  return {
+    uploadDir: session.uploadDir,
+    relativeInput: path.relative(paths.root, session.uploadDir),
+    savedFiles,
+    spaceRoot: paths.root,
+  };
+}
+
 function createImportJobId() {
   return `job_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
 }
@@ -2852,6 +3101,7 @@ function getImportJobPath(spaceId, jobId) {
 function sanitizeImportJob(job) {
   return {
     id: job.id,
+    uploadId: job.uploadId || "",
     space: job.space,
     project: job.project,
     mode: job.mode,
@@ -2874,6 +3124,44 @@ function sanitizeImportJob(job) {
     maxAttempts: Number(job.maxAttempts || IMPORT_MAX_ATTEMPTS),
     nextRetryAt: job.nextRetryAt || "",
   };
+}
+
+async function cleanupExpiredUploadSessions() {
+  const threshold = Date.now() - UPLOAD_SESSION_RETENTION_HOURS * 60 * 60 * 1000;
+  for (const space of await listSpaces()) {
+    const paths = await ensureKnowledgeBase(space.id);
+    for (const entry of await readdir(paths.uploadSessionDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const sessionRoot = path.join(paths.uploadSessionDir, entry.name);
+      try {
+        const session = JSON.parse(await readFile(path.join(sessionRoot, "session.json"), "utf8"));
+        const referenceTime = Date.parse(session.completedAt || session.updatedAt || session.createdAt || "");
+        if (Number.isFinite(referenceTime) && referenceTime < threshold) {
+          await rm(sessionRoot, { recursive: true, force: true });
+        }
+      } catch {
+        const info = await stat(sessionRoot);
+        if (info.mtimeMs < threshold) await rm(sessionRoot, { recursive: true, force: true });
+      }
+    }
+  }
+}
+
+async function countActiveUploadSessions(spaceId) {
+  const paths = await ensureKnowledgeBase(spaceId);
+  let active = 0;
+  for (const entry of await readdir(paths.uploadSessionDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const session = JSON.parse(
+        await readFile(path.join(paths.uploadSessionDir, entry.name, "session.json"), "utf8")
+      );
+      if (session.status !== "completed") active += 1;
+    } catch {
+      active += 1;
+    }
+  }
+  return active;
 }
 
 async function readImportJob(spaceId, jobId) {
@@ -3098,10 +3386,11 @@ async function runImportJob(spaceId, jobId) {
   }
 }
 
-async function createImportJob({ space, project, mode, outputName, saved }) {
+async function createImportJob({ space, project, mode, outputName, saved, id = "", uploadId = "" }) {
   const now = new Date().toISOString();
   const job = await writeImportJob({
-    id: createImportJobId(),
+    id: id || createImportJobId(),
+    uploadId,
     space,
     project,
     mode,
@@ -3125,6 +3414,156 @@ async function createImportJob({ space, project, mode, outputName, saved }) {
   enqueueImportJob(space, job.id);
 
   return job;
+}
+
+async function handleInitChunkedUpload(request, response) {
+  const user = request.authUser;
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  const project = String(payload.project || "").trim();
+  const mode = String(payload.mode || "mixed").trim();
+  const outputName = String(payload.outputName || "").trim();
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response, "只有项目资料管理员可以上传资料");
+    return;
+  }
+  if (!project) {
+    sendJson(response, 400, { error: "项目名称不能为空" });
+    return;
+  }
+  if (!["project", "faq", "sop", "analysis", "mixed"].includes(mode)) {
+    sendJson(response, 400, { error: "整理类型不支持" });
+    return;
+  }
+  try {
+    const upload = await createChunkedUploadSession({
+      user,
+      space,
+      project,
+      mode,
+      outputName,
+      files: payload.files,
+    });
+    await appendAuditLog({
+      request,
+      user,
+      action: "upload.init",
+      space,
+      target: upload.id,
+      detail: `${project} / ${upload.files.length} 个文件`,
+    });
+    sendJson(response, 200, { ok: true, upload });
+  } catch (error) {
+    sendJson(response, 400, { error: "无法创建上传会话", detail: error.message });
+  }
+}
+
+async function handleGetChunkedUpload(request, response, requestUrl, uploadId) {
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  try {
+    const upload = await getUploadSessionStatus(space, uploadId, request.authUser);
+    sendJson(response, 200, { ok: true, upload });
+  } catch (error) {
+    sendJson(response, error.code === "ENOENT" ? 404 : 400, {
+      error: "无法读取上传会话",
+      detail: error.message,
+    });
+  }
+}
+
+async function handleSaveUploadChunk(request, response, uploadId, fileIndex, chunkIndex) {
+  let requestedSpace = String(request.headers["x-knowledge-space"] || DEFAULT_SPACE_ID);
+  try {
+    requestedSpace = decodeURIComponent(requestedSpace);
+  } catch {
+    // Keep the original value so normalizeSpaceId can safely sanitize it.
+  }
+  const space = normalizeSpaceId(requestedSpace);
+  try {
+    const result = await saveUploadChunk({
+      request,
+      user: request.authUser,
+      space,
+      uploadId,
+      fileIndex: Number(fileIndex),
+      chunkIndex: Number(chunkIndex),
+    });
+    sendJson(response, 200, { ok: true, ...result });
+  } catch (error) {
+    sendJson(response, 400, { error: "上传分片失败", detail: error.message });
+  }
+}
+
+async function handleCompleteChunkedUpload(request, response, uploadId) {
+  const user = request.authUser;
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  try {
+    const loaded = await readUploadSession(space, uploadId);
+    const { session, paths } = loaded;
+    assertUploadSessionAccess(user, session);
+    if (session.status === "completed" && session.jobId) {
+      const job = await readImportJob(space, session.jobId);
+      sendJson(response, 200, {
+        ok: true,
+        resumed: true,
+        jobId: job.id,
+        job: sanitizeImportJob(job),
+        uploadDir: session.uploadDir,
+        savedFiles: session.savedFiles || job.savedFiles || [],
+        stdout: `上传已经完成，继续处理任务：${job.id}`,
+      });
+      return;
+    }
+
+    const jobId = session.jobId || createImportJobId();
+    await writeUploadSession(space, { ...session, status: "assembling", jobId });
+    const saved = await assembleChunkedUpload(session, paths);
+    const existingJobPath = getImportJobPath(space, jobId);
+    const job = await pathExists(existingJobPath)
+      ? await readImportJob(space, jobId)
+      : await createImportJob({
+        space,
+        project: session.project,
+        mode: session.mode,
+        outputName: session.outputName,
+        saved,
+        id: jobId,
+        uploadId,
+      });
+    await writeUploadSession(space, {
+      ...session,
+      status: "completed",
+      jobId: job.id,
+      savedFiles: saved.savedFiles,
+      completedAt: new Date().toISOString(),
+    });
+    await rm(paths.chunksRoot, { recursive: true, force: true });
+    await appendAuditLog({
+      request,
+      user,
+      action: "upload.complete",
+      space,
+      target: uploadId,
+      detail: `${session.project} / ${session.files.length} 个文件 / ${job.id}`,
+    });
+    sendJson(response, 200, {
+      ok: true,
+      jobId: job.id,
+      job: sanitizeImportJob(job),
+      uploadDir: saved.uploadDir,
+      savedFiles: saved.savedFiles,
+      stdout: [
+        `分片上传完成：${uploadId}`,
+        `入库任务已提交：${job.id}`,
+        `原始资料目录：${saved.uploadDir}`,
+      ].join("\n"),
+    });
+  } catch (error) {
+    sendJson(response, 400, { error: "无法完成分片上传", detail: error.message });
+  }
 }
 
 async function handleImportKnowledge(request, response) {
@@ -3670,6 +4109,7 @@ async function getOperationsStatus(spaceId) {
     queue: {
       active: activeImportJobs.size,
       pending: pendingImportJobs.length,
+      uploading: await countActiveUploadSessions(spaceId),
       retrying: jobs.filter((job) => job.status === "retrying").length,
       failed: jobs.filter((job) => job.status === "failed").length,
     },
@@ -4136,6 +4576,46 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && requestUrl.pathname === "/api/uploads/init") {
+    await handleInitChunkedUpload(request, response);
+    return;
+  }
+
+  const uploadChunkMatch = requestUrl.pathname.match(
+    /^\/api\/uploads\/([^/]+)\/files\/(\d+)\/chunks\/(\d+)$/
+  );
+  if (request.method === "PUT" && uploadChunkMatch) {
+    await handleSaveUploadChunk(
+      request,
+      response,
+      decodeURIComponent(uploadChunkMatch[1]),
+      uploadChunkMatch[2],
+      uploadChunkMatch[3]
+    );
+    return;
+  }
+
+  const uploadCompleteMatch = requestUrl.pathname.match(/^\/api\/uploads\/([^/]+)\/complete$/);
+  if (request.method === "POST" && uploadCompleteMatch) {
+    await handleCompleteChunkedUpload(
+      request,
+      response,
+      decodeURIComponent(uploadCompleteMatch[1])
+    );
+    return;
+  }
+
+  const uploadStatusMatch = requestUrl.pathname.match(/^\/api\/uploads\/([^/]+)$/);
+  if (request.method === "GET" && uploadStatusMatch) {
+    await handleGetChunkedUpload(
+      request,
+      response,
+      requestUrl,
+      decodeURIComponent(uploadStatusMatch[1])
+    );
+    return;
+  }
+
   if (request.method === "GET" && requestUrl.pathname === "/api/import-jobs") {
     await handleListImportJobs(requestUrl, response);
     return;
@@ -4315,8 +4795,10 @@ if (KNOWLEDGE_ENCRYPTION_ENABLED) {
 await ensureKnowledgeBase(DEFAULT_SPACE_ID);
 await resumePendingImportJobs();
 await purgeExpiredTrash().catch(() => {});
+await cleanupExpiredUploadSessions().catch(() => {});
 await runAutomaticBackups().catch(() => {});
 setInterval(() => purgeExpiredTrash().catch(() => {}), 6 * 60 * 60 * 1000).unref();
+setInterval(() => cleanupExpiredUploadSessions().catch(() => {}), 6 * 60 * 60 * 1000).unref();
 if (AUTO_BACKUP_ENABLED) {
   setInterval(() => runAutomaticBackups().catch(() => {}), 60 * 60 * 1000).unref();
 }
