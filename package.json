@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "decrypt-kb": "node scripts/knowledge_crypto.js decrypt"
   },
   "engines": {
     "node": ">=18"

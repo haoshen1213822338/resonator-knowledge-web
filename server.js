@@ -1,7 +1,17 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
-import { appendFile, cp, mkdir, readFile, readdir, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  scrypt as scryptCallback,
+  timingSafeEqual,
+} from "node:crypto";
+import { appendFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { promisify } from "node:util";
@@ -30,6 +40,17 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
 const AUTH_STORE_PATH = path.join(DATA_DIR, "auth.json");
 const AUDIT_LOG_PATH = path.join(DATA_DIR, "audit.ndjson");
+const KNOWLEDGE_ENCRYPTION_ENABLED = !["0", "false", "disabled"].includes(
+  String(process.env.KNOWLEDGE_ENCRYPTION_ENABLED || "true").toLowerCase()
+);
+const KNOWLEDGE_KEY_PATH = path.resolve(
+  process.env.KNOWLEDGE_KEY_PATH || path.join(DATA_DIR, "knowledge-encryption.key")
+);
+const KNOWLEDGE_KEY_ENV = String(process.env.KNOWLEDGE_ENCRYPTION_KEY || "").trim();
+const ENCRYPTION_MAGIC = Buffer.from("RSKB1", "ascii");
+const ENCRYPTION_IV_BYTES = 12;
+const ENCRYPTION_TAG_BYTES = 16;
+const ENCRYPTION_AAD = Buffer.from("resonator-knowledge-v1", "utf8");
 const BACKUP_RETENTION_COUNT = Math.max(1, Number(process.env.BACKUP_RETENTION_COUNT || 7));
 const AUTO_BACKUP_ENABLED = ["1", "true", "enabled"].includes(
   String(process.env.AUTO_BACKUP_ENABLED || "false").toLowerCase()
@@ -70,6 +91,7 @@ const vectorSearchWarnings = new Set();
 const vectorQueryCache = new Map();
 const VECTOR_QUERY_CACHE_TTL_MS = 5 * 60_000;
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+let knowledgeEncryptionKey = null;
 const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   ".md",
   ".txt",
@@ -408,6 +430,121 @@ async function pathExists(targetPath) {
   }
 }
 
+function decodeConfiguredEncryptionKey(value) {
+  if (!value) return null;
+  const key = /^[a-f0-9]{64}$/i.test(value)
+    ? Buffer.from(value, "hex")
+    : Buffer.from(value, "base64");
+  if (key.length !== 32) {
+    throw new Error("KNOWLEDGE_ENCRYPTION_KEY 必须是 32 字节密钥（Base64 或 64 位十六进制）");
+  }
+  return key;
+}
+
+async function getKnowledgeEncryptionKey() {
+  if (!KNOWLEDGE_ENCRYPTION_ENABLED) return null;
+  if (knowledgeEncryptionKey) return knowledgeEncryptionKey;
+
+  const configuredKey = decodeConfiguredEncryptionKey(KNOWLEDGE_KEY_ENV);
+  if (configuredKey) {
+    knowledgeEncryptionKey = configuredKey;
+    return knowledgeEncryptionKey;
+  }
+
+  await mkdir(path.dirname(KNOWLEDGE_KEY_PATH), { recursive: true });
+  try {
+    const storedKey = await readFile(KNOWLEDGE_KEY_PATH);
+    if (storedKey.length !== 32) {
+      throw new Error(`知识库密钥文件长度异常：${KNOWLEDGE_KEY_PATH}`);
+    }
+    knowledgeEncryptionKey = storedKey;
+    return knowledgeEncryptionKey;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  const generatedKey = randomBytes(32);
+  try {
+    await writeFile(KNOWLEDGE_KEY_PATH, generatedKey, { flag: "wx", mode: 0o600 });
+    knowledgeEncryptionKey = generatedKey;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    knowledgeEncryptionKey = await readFile(KNOWLEDGE_KEY_PATH);
+  }
+  return knowledgeEncryptionKey;
+}
+
+function isEncryptedKnowledgeBuffer(buffer) {
+  return Buffer.isBuffer(buffer) &&
+    buffer.length >= ENCRYPTION_MAGIC.length + ENCRYPTION_IV_BYTES + ENCRYPTION_TAG_BYTES &&
+    buffer.subarray(0, ENCRYPTION_MAGIC.length).equals(ENCRYPTION_MAGIC);
+}
+
+async function encryptKnowledgeBuffer(plainBuffer) {
+  if (!KNOWLEDGE_ENCRYPTION_ENABLED) return Buffer.from(plainBuffer);
+  const key = await getKnowledgeEncryptionKey();
+  const iv = randomBytes(ENCRYPTION_IV_BYTES);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(ENCRYPTION_AAD);
+  const ciphertext = Buffer.concat([cipher.update(plainBuffer), cipher.final()]);
+  return Buffer.concat([ENCRYPTION_MAGIC, iv, cipher.getAuthTag(), ciphertext]);
+}
+
+async function decryptKnowledgeBuffer(encryptedBuffer) {
+  if (!isEncryptedKnowledgeBuffer(encryptedBuffer)) return Buffer.from(encryptedBuffer);
+  const key = await getKnowledgeEncryptionKey();
+  const ivStart = ENCRYPTION_MAGIC.length;
+  const tagStart = ivStart + ENCRYPTION_IV_BYTES;
+  const contentStart = tagStart + ENCRYPTION_TAG_BYTES;
+  const decipher = createDecipheriv(
+    "aes-256-gcm",
+    key,
+    encryptedBuffer.subarray(ivStart, tagStart)
+  );
+  decipher.setAAD(ENCRYPTION_AAD);
+  decipher.setAuthTag(encryptedBuffer.subarray(tagStart, contentStart));
+  try {
+    return Buffer.concat([
+      decipher.update(encryptedBuffer.subarray(contentStart)),
+      decipher.final(),
+    ]);
+  } catch {
+    throw new Error("知识文件解密失败：密钥不匹配或文件已损坏");
+  }
+}
+
+async function readKnowledgeText(filePath) {
+  const content = await readFile(filePath);
+  return (await decryptKnowledgeBuffer(content)).toString("utf8");
+}
+
+async function writeProtectedFile(filePath, plainBuffer) {
+  const protectedContent = await encryptKnowledgeBuffer(plainBuffer);
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+  await mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await writeFile(temporaryPath, protectedContent, { mode: 0o600 });
+    await rename(temporaryPath, filePath);
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
+async function writeKnowledgeText(filePath, content) {
+  await writeProtectedFile(filePath, Buffer.from(String(content), "utf8"));
+}
+
+async function getKnowledgeEncryptionInfo(filePath) {
+  const content = await readFile(filePath);
+  return { encrypted: isEncryptedKnowledgeBuffer(content), size: content.length };
+}
+
+async function getKnowledgeKeyId() {
+  if (!KNOWLEDGE_ENCRYPTION_ENABLED) return "";
+  const key = await getKnowledgeEncryptionKey();
+  return createHash("sha256").update(key).digest("hex").slice(0, 12);
+}
+
 function normalizeSpaceId(value) {
   const normalized = safePathSegment(value || DEFAULT_SPACE_ID);
   return normalized || DEFAULT_SPACE_ID;
@@ -617,6 +754,9 @@ async function listManagedFiles(spaceId = DEFAULT_SPACE_ID, { type = "all", quer
         size: info.size,
         modifiedAt: info.mtime.toISOString(),
         canDelete: ["ai", "upload", "raw"].includes(fileType),
+        encrypted: fileType === "ai"
+          ? (await getKnowledgeEncryptionInfo(filePath)).encrypted
+          : false,
       });
     }
   }
@@ -770,7 +910,18 @@ async function createSpaceBackup(spaceId, reason = "manual", includeSystemData =
   const files = await listFilesRecursive(snapshotRoot);
   let totalBytes = 0;
   for (const file of files) totalBytes += (await stat(file)).size;
-  const manifest = { id, space: paths.id, createdAt, reason, files: files.length, totalBytes, systemDataIncluded, backupRoot };
+  const manifest = {
+    id,
+    space: paths.id,
+    createdAt,
+    reason,
+    files: files.length,
+    totalBytes,
+    systemDataIncluded,
+    backupRoot,
+    knowledgeEncryptionEnabled: KNOWLEDGE_ENCRYPTION_ENABLED,
+    knowledgeKeyId: await getKnowledgeKeyId(),
+  };
   await writeFile(path.join(backupRoot, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
 
   const oldBackups = (await listBackups(paths.id)).slice(BACKUP_RETENTION_COUNT);
@@ -790,6 +941,12 @@ async function restoreSpaceBackup(backupId, requestedName = "") {
     throw new Error("备份路径无效。");
   }
   const manifest = JSON.parse(await readFile(path.join(backupRoot, "manifest.json"), "utf8"));
+  const currentKeyId = await getKnowledgeKeyId();
+  if (manifest.knowledgeKeyId && manifest.knowledgeKeyId !== currentKeyId) {
+    throw new Error(
+      `备份使用的知识库密钥不匹配（备份 ${manifest.knowledgeKeyId}，当前 ${currentKeyId || "未启用"}）`
+    );
+  }
   const baseName = requestedName || `${manifest.space}_恢复_${new Date().toISOString().slice(0, 10)}`;
   let targetSpace = normalizeSpaceId(baseName);
   let suffix = 1;
@@ -808,6 +965,10 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
   const rawFiles = await listFilesRecursive(paths.rawDir, SUPPORTED_UPLOAD_EXTENSIONS);
   const uploadedFiles = await listFilesRecursive(paths.uploadRoot, SUPPORTED_UPLOAD_EXTENSIONS);
   const aiFiles = await listFilesRecursive(paths.knowledgeDir, new Set([".md"]));
+  let encryptedAiFiles = 0;
+  for (const filePath of aiFiles) {
+    if ((await getKnowledgeEncryptionInfo(filePath)).encrypted) encryptedAiFiles += 1;
+  }
   const allFiles = [...rawFiles, ...aiFiles];
   const vectorIndexInfo = await readVectorIndexStatus(paths.vectorIndex);
 
@@ -828,6 +989,13 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
     aiProvider: AI_PROVIDER,
     aiModel: AI_MODEL,
     aiVisionModel: AI_VISION_MODEL,
+    encryption: {
+      enabled: KNOWLEDGE_ENCRYPTION_ENABLED,
+      keyId: await getKnowledgeKeyId(),
+      encryptedFiles: encryptedAiFiles,
+      plaintextFiles: aiFiles.length - encryptedAiFiles,
+      keySource: KNOWLEDGE_KEY_ENV ? "environment" : "server-key-file",
+    },
     vectorEnabled: VECTOR_ENABLED,
     vectorModel: VECTOR_MODEL,
     vectorIndex: vectorIndexInfo,
@@ -842,7 +1010,8 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
 
 async function readVectorIndexStatus(indexPath) {
   try {
-    const content = JSON.parse(await readFile(indexPath, "utf8"));
+    const storedContent = await readFile(indexPath);
+    const content = JSON.parse((await decryptKnowledgeBuffer(storedContent)).toString("utf8"));
     const info = await stat(indexPath);
     return {
       ready: true,
@@ -850,6 +1019,7 @@ async function readVectorIndexStatus(indexPath) {
       chunks: Array.isArray(content.chunks) ? content.chunks.length : 0,
       model: content.model || VECTOR_MODEL,
       updatedAt: info.mtime.toISOString(),
+      encrypted: isEncryptedKnowledgeBuffer(storedContent),
     };
   } catch (error) {
     if (["ENOENT", "EISDIR"].includes(error.code) || error instanceof SyntaxError) {
@@ -1704,7 +1874,7 @@ async function writeKnowledgeOutput({ spaceId, project, mode, outputName, savedF
     "",
   ].join("\n");
 
-  await writeFile(outputPath, finalContent, "utf8");
+  await writeKnowledgeText(outputPath, finalContent);
 
   const logPath = path.join(
     paths.updateLogDir,
@@ -2023,7 +2193,7 @@ function scoreDocument(content, fileName, tokens, question = "", aliasGroups = [
   return score;
 }
 
-function runVectorCommand(paths, command, query = "", force = false) {
+function runVectorProcess(paths, command, query = "", force = false) {
   return new Promise((resolve, reject) => {
     const args = [
       VECTOR_SEARCH_SCRIPT,
@@ -2081,6 +2251,53 @@ function runVectorCommand(paths, command, query = "", force = false) {
   });
 }
 
+async function createDecryptedVectorWorkspace(paths, command) {
+  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "resonator-vector-"));
+  const temporaryKnowledgeDir = path.join(temporaryRoot, "knowledge");
+  const temporaryIndex = path.join(temporaryRoot, "index.json");
+  await mkdir(temporaryKnowledgeDir, { recursive: true });
+
+  if (command === "build") {
+    for (const sourcePath of await listMarkdownFiles(paths.knowledgeDir)) {
+      const relativePath = path.relative(paths.knowledgeDir, sourcePath);
+      const targetPath = path.join(temporaryKnowledgeDir, relativePath);
+      await mkdir(path.dirname(targetPath), { recursive: true });
+      await writeFile(targetPath, await readKnowledgeText(sourcePath), "utf8");
+    }
+  }
+
+  if (await pathExists(paths.vectorIndex)) {
+    const protectedIndex = await readFile(paths.vectorIndex);
+    await writeFile(temporaryIndex, await decryptKnowledgeBuffer(protectedIndex));
+  }
+
+  return {
+    temporaryRoot,
+    paths: {
+      ...paths,
+      knowledgeDir: temporaryKnowledgeDir,
+      vectorIndex: temporaryIndex,
+    },
+  };
+}
+
+async function runVectorCommand(paths, command, query = "", force = false) {
+  if (!KNOWLEDGE_ENCRYPTION_ENABLED) {
+    return runVectorProcess(paths, command, query, force);
+  }
+
+  const workspace = await createDecryptedVectorWorkspace(paths, command);
+  try {
+    const result = await runVectorProcess(workspace.paths, command, query, force);
+    if (command === "build" && await pathExists(workspace.paths.vectorIndex)) {
+      await writeProtectedFile(paths.vectorIndex, await readFile(workspace.paths.vectorIndex));
+    }
+    return result;
+  } finally {
+    await rm(workspace.temporaryRoot, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function searchSemanticKnowledge(question, paths) {
   if (!VECTOR_ENABLED) {
     return [];
@@ -2112,9 +2329,12 @@ function mergeHybridResults(keywordResults, semanticResults, question, aliasGrou
   const candidates = new Map();
   const maxKeywordScore = Math.max(...keywordResults.map((item) => item.score), 1);
   const requireProjectMatch = hasExplicitProjectReference(question, aliasGroups);
+  const resultKey = (item) => String(item.relativePath || item.file || item.path)
+    .replace(/\\/g, "/")
+    .toLowerCase();
 
   keywordResults.forEach((item, rank) => {
-    const key = path.resolve(item.path).toLowerCase();
+    const key = resultKey(item);
     candidates.set(key, {
       ...item,
       keywordScore: item.score,
@@ -2127,11 +2347,12 @@ function mergeHybridResults(keywordResults, semanticResults, question, aliasGrou
   });
 
   semanticResults.forEach((item, rank) => {
-    const key = path.resolve(item.path).toLowerCase();
+    const key = resultKey(item);
     const semanticScore = Math.max(0, Number(item.semanticScore || 0));
     const existing = candidates.get(key) || {
       file: item.file,
       path: item.path,
+      relativePath: item.relativePath || item.file,
       score: 0,
       keywordScore: 0,
       semanticScore: 0,
@@ -2179,20 +2400,24 @@ async function searchKnowledge(question, spaceId = DEFAULT_SPACE_ID) {
   const files = await listMarkdownFiles(paths.knowledgeDir);
   const keywordResults = [];
   for (const filePath of files) {
-    const content = await readFile(filePath, "utf8");
+    const content = await readKnowledgeText(filePath);
     const fileName = path.basename(filePath);
     const score = scoreDocument(content, fileName, tokens, question, aliasGroups);
     if (score > 0) {
       keywordResults.push({
         file: fileName,
         path: filePath,
+        relativePath: path.relative(paths.knowledgeDir, filePath),
         score,
         snippet: buildSnippet(content, tokens, question, intent),
       });
     }
   }
   keywordResults.sort((a, b) => b.score - a.score);
-  const semanticResults = await searchSemanticKnowledge(expandedQuestion, paths);
+  const semanticResults = (await searchSemanticKnowledge(expandedQuestion, paths)).map((item) => ({
+    ...item,
+    path: path.join(paths.knowledgeDir, item.relativePath || item.file),
+  }));
   return mergeHybridResults(keywordResults.slice(0, 12), semanticResults, question, aliasGroups);
 }
 
@@ -3254,6 +3479,75 @@ async function handleDeleteManagedFile(request, response) {
   }
 }
 
+async function migrateKnowledgeEncryption(spaceId) {
+  if (!KNOWLEDGE_ENCRYPTION_ENABLED) {
+    throw new Error("知识资料加密当前未启用");
+  }
+  const paths = await ensureKnowledgeBase(spaceId);
+  const files = await listMarkdownFiles(paths.knowledgeDir);
+  let encryptedFiles = 0;
+  let alreadyEncrypted = 0;
+  for (const filePath of files) {
+    const content = await readFile(filePath);
+    if (isEncryptedKnowledgeBuffer(content)) {
+      alreadyEncrypted += 1;
+      continue;
+    }
+    await writeProtectedFile(filePath, content);
+    encryptedFiles += 1;
+  }
+
+  let vectorIndexEncrypted = false;
+  if (await pathExists(paths.vectorIndex)) {
+    const indexContent = await readFile(paths.vectorIndex);
+    if (!isEncryptedKnowledgeBuffer(indexContent)) {
+      await writeProtectedFile(paths.vectorIndex, indexContent);
+      vectorIndexEncrypted = true;
+    }
+  }
+  for (const cacheKey of vectorQueryCache.keys()) {
+    if (cacheKey.startsWith(`${paths.id}:`)) vectorQueryCache.delete(cacheKey);
+  }
+  return {
+    files: files.length,
+    encryptedFiles,
+    alreadyEncrypted,
+    vectorIndexEncrypted,
+    keyId: await getKnowledgeKeyId(),
+  };
+}
+
+async function handleMigrateKnowledgeEncryption(request, response) {
+  const user = request.authUser;
+  if (user?.role !== "admin") {
+    sendForbidden(response, "只有超级管理员可以迁移加密资料");
+    return;
+  }
+  const payload = await readRequestJson(request, response);
+  if (!payload) return;
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  if (!userCanAccessSpace(user, space)) {
+    sendForbidden(response);
+    return;
+  }
+  try {
+    const result = await migrateKnowledgeEncryption(space);
+    await appendAuditLog({
+      request,
+      user,
+      action: "encryption.migrate",
+      space,
+      detail: `${result.encryptedFiles} encrypted / ${result.alreadyEncrypted} unchanged`,
+    });
+    sendJson(response, 200, { ok: true, space, result, status: await getKnowledgeBaseStatus(space) });
+  } catch (error) {
+    sendJson(response, 500, {
+      error: "已有资料加密失败",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function handleListTrash(requestUrl, response) {
   const user = response.authUser;
   const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
@@ -3969,6 +4263,11 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && requestUrl.pathname === "/api/encryption/migrate") {
+    await handleMigrateKnowledgeEncryption(request, response);
+    return;
+  }
+
   if (request.method === "GET" && requestUrl.pathname === "/api/search-diagnostics") {
     await handleSearchDiagnostics(request, response, requestUrl);
     return;
@@ -4010,6 +4309,9 @@ const server = createServer(async (request, response) => {
   response.end("Method not allowed");
 });
 
+if (KNOWLEDGE_ENCRYPTION_ENABLED) {
+  await getKnowledgeEncryptionKey();
+}
 await ensureKnowledgeBase(DEFAULT_SPACE_ID);
 await resumePendingImportJobs();
 await purgeExpiredTrash().catch(() => {});
@@ -4022,4 +4324,5 @@ if (AUTO_BACKUP_ENABLED) {
 server.listen(PORT, () => {
   console.log(`知识库网页已启动：http://localhost:${PORT}`);
   console.log(`知识库总目录：${SPACES_ROOT}`);
+  console.log(`知识资料加密：${KNOWLEDGE_ENCRYPTION_ENABLED ? "已启用" : "未启用"}`);
 });

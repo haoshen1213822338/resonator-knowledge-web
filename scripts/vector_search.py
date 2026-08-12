@@ -269,6 +269,7 @@ def search_index(
             {
                 "file": chunk["file"],
                 "path": chunk["path"],
+                "relativePath": chunk.get("relativePath", chunk["file"]),
                 "heading": chunk["heading"],
                 "text": chunk["text"],
                 "semanticScore": round(cosine_similarity(query_vector, chunk["vector"]), 6),

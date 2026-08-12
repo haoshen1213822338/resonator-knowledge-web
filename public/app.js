@@ -47,6 +47,9 @@ const apiState = document.querySelector("#api-state");
 const vectorState = document.querySelector("#vector-state");
 const vectorDetail = document.querySelector("#vector-detail");
 const rebuildVectorIndexButton = document.querySelector("#rebuild-vector-index");
+const encryptionState = document.querySelector("#encryption-state");
+const encryptionDetail = document.querySelector("#encryption-detail");
+const migrateEncryptionButton = document.querySelector("#migrate-encryption");
 const kbPath = document.querySelector("#kb-path");
 const refreshStatus = document.querySelector("#refresh-status");
 const importPanel = document.querySelector("#import-panel");
@@ -427,6 +430,7 @@ function getAuditActionLabel(action) {
     "file.purge": "彻底删除",
     "backup.create": "创建备份",
     "backup.restore": "恢复备份",
+    "encryption.migrate": "加密已有资料",
     "import.retry": "重试入库",
     "user.create": "创建账号",
     "user.update": "修改账号",
@@ -1023,6 +1027,20 @@ function renderKnowledgeStatus(status) {
       ? `${status.vectorIndex.files} 个文件 · ${status.vectorIndex.chunks} 个语义片段`
       : `本地模型：${status.vectorModel || "未配置"}`;
   }
+  if (encryptionState) {
+    encryptionState.textContent = status.encryption?.enabled ? "已启用" : "未启用";
+  }
+  if (encryptionDetail) {
+    const encryption = status.encryption || {};
+    encryptionDetail.textContent = encryption.enabled
+      ? `已加密 ${encryption.encryptedFiles || 0} 个 · 明文 ${encryption.plaintextFiles || 0} 个 · 密钥 ${encryption.keyId || "未就绪"}`
+      : "新生成的知识文档仍会以明文保存";
+  }
+  if (migrateEncryptionButton) {
+    const canMigrate = currentUser?.role === "admin" &&
+      status.encryption?.enabled && Number(status.encryption?.plaintextFiles || 0) > 0;
+    migrateEncryptionButton.classList.toggle("hidden", !canMigrate);
+  }
   if (kbPath) {
     kbPath.textContent = [
       `当前项目库：${status.spaceRoot}`,
@@ -1058,6 +1076,36 @@ async function rebuildVectorIndex() {
   } finally {
     rebuildVectorIndexButton.disabled = false;
     rebuildVectorIndexButton.textContent = "更新语义索引";
+  }
+}
+
+async function migrateKnowledgeEncryption() {
+  if (!migrateEncryptionButton) return;
+  const confirmed = window.confirm(
+    "将把当前项目库的 AI 整理文档和向量索引转换为密文。转换后 Obsidian 不能直接阅读这些文件，但网页问答仍可正常使用。继续吗？"
+  );
+  if (!confirmed) return;
+  migrateEncryptionButton.disabled = true;
+  migrateEncryptionButton.textContent = "正在加密...";
+  if (encryptionDetail) encryptionDetail.textContent = "正在逐个保护已有知识文件，请不要关闭服务。";
+  try {
+    const response = await apiFetch("/api/encryption/migrate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ space: getCurrentSpace() }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || payload.error || "资料加密失败");
+    await loadKnowledgeStatus();
+    await loadManagedFiles();
+    await loadAuditLogs();
+  } catch (error) {
+    if (encryptionDetail) {
+      encryptionDetail.textContent = error instanceof Error ? error.message : "资料加密失败";
+    }
+  } finally {
+    migrateEncryptionButton.disabled = false;
+    migrateEncryptionButton.textContent = "加密已有资料";
   }
 }
 
@@ -1208,6 +1256,7 @@ function renderManagedFiles(files = []) {
             <span>${escapeHtml(file.extension || "")}</span>
             <span>${escapeHtml(formatFileSize(file.size))}</span>
             <span>${escapeHtml(formatLatestUpdate(file.modifiedAt))}</span>
+            ${file.type === "ai" ? `<span>${file.encrypted ? "已加密" : "明文"}</span>` : ""}
           </div>
           <div class="file-row-actions">
             <button type="button" data-file-copy="${escapeHtml(file.absolutePath)}">复制路径</button>
@@ -1751,6 +1800,7 @@ refreshStatus?.addEventListener("click", async () => {
   await loadOperations();
 });
 rebuildVectorIndexButton?.addEventListener("click", rebuildVectorIndex);
+migrateEncryptionButton?.addEventListener("click", migrateKnowledgeEncryption);
 refreshFiles?.addEventListener("click", loadManagedFiles);
 toggleFileManager?.addEventListener("click", () => {
   applyFileManagerCollapsed(!isFileManagerCollapsed());

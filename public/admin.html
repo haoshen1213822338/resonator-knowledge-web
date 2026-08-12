@@ -202,10 +202,16 @@
                 <span>语义检索</span>
                 <strong id="vector-state">检查中</strong>
               </div>
+              <div class="status-item">
+                <span>资料加密</span>
+                <strong id="encryption-state">检查中</strong>
+              </div>
             </div>
             <div class="status-actions">
               <button type="button" class="ghost-button compact-button" id="rebuild-vector-index">更新语义索引</button>
               <span id="vector-detail">等待读取索引状态。</span>
+              <button type="button" class="ghost-button compact-button hidden" id="migrate-encryption">加密已有资料</button>
+              <span id="encryption-detail">正在检查资料保护状态。</span>
             </div>
             <div class="status-footer">
               <span id="kb-path">正在读取本地知识库路径。</span>
