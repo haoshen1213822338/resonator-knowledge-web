@@ -44,6 +44,18 @@ const FILE_EXTRACTOR_SCRIPT =
   process.env.FILE_EXTRACTOR_SCRIPT || path.join(__dirname, "scripts", "extract_file.py");
 const PARSER_PYTHON_CMD =
   process.env.PARSER_PYTHON_CMD || process.env.PYTHON_CMD || "python";
+const VECTOR_SEARCH_SCRIPT =
+  process.env.VECTOR_SEARCH_SCRIPT || path.join(__dirname, "scripts", "vector_search.py");
+const VECTOR_MODEL = process.env.VECTOR_MODEL || "BAAI/bge-small-zh-v1.5";
+const VECTOR_ENABLED = !["0", "false", "disabled"].includes(
+  String(process.env.VECTOR_ENABLED || "true").toLowerCase()
+);
+const VECTOR_CACHE_DIR = path.resolve(
+  process.env.VECTOR_CACHE_DIR || path.join(DATA_DIR, "models")
+);
+const vectorSearchWarnings = new Set();
+const vectorQueryCache = new Map();
+const VECTOR_QUERY_CACHE_TTL_MS = 5 * 60_000;
 const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   ".md",
   ".txt",
@@ -407,6 +419,8 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
   const updateLogDir = path.join(systemDir, "update_logs");
   const importJobDir = path.join(systemDir, "import_jobs");
   const importIndex = path.join(systemDir, "资料入库记录.md");
+  const vectorDir = path.join(systemDir, "vector_index");
+  const vectorIndex = path.join(vectorDir, "index.json");
   return {
     id,
     root,
@@ -418,6 +432,8 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
     updateLogDir,
     importJobDir,
     importIndex,
+    vectorDir,
+    vectorIndex,
     folders: [
       rawDir,
       uploadRoot,
@@ -427,6 +443,7 @@ function getSpacePaths(spaceId = DEFAULT_SPACE_ID) {
       path.join(systemDir, "scripts"),
       updateLogDir,
       importJobDir,
+      vectorDir,
     ],
   };
 }
@@ -613,6 +630,7 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
   const uploadedFiles = await listFilesRecursive(paths.uploadRoot, SUPPORTED_UPLOAD_EXTENSIONS);
   const aiFiles = await listFilesRecursive(paths.knowledgeDir, new Set([".md"]));
   const allFiles = [...rawFiles, ...aiFiles];
+  const vectorIndexInfo = await readVectorIndexStatus(paths.vectorIndex);
 
   return {
     ok: true,
@@ -630,6 +648,9 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
     hasApiKey: Boolean(AI_API_KEY),
     aiProvider: AI_PROVIDER,
     aiModel: AI_MODEL,
+    vectorEnabled: VECTOR_ENABLED,
+    vectorModel: VECTOR_MODEL,
+    vectorIndex: vectorIndexInfo,
     counts: {
       rawFiles: rawFiles.length,
       uploadedFiles: uploadedFiles.length,
@@ -637,6 +658,25 @@ async function getKnowledgeBaseStatus(spaceId = DEFAULT_SPACE_ID) {
     },
     latestUpdate: await getLatestWriteTime(allFiles),
   };
+}
+
+async function readVectorIndexStatus(indexPath) {
+  try {
+    const content = JSON.parse(await readFile(indexPath, "utf8"));
+    const info = await stat(indexPath);
+    return {
+      ready: true,
+      files: Object.keys(content.files || {}).length,
+      chunks: Array.isArray(content.chunks) ? content.chunks.length : 0,
+      model: content.model || VECTOR_MODEL,
+      updatedAt: info.mtime.toISOString(),
+    };
+  } catch (error) {
+    if (["ENOENT", "EISDIR"].includes(error.code) || error instanceof SyntaxError) {
+      return { ready: false, files: 0, chunks: 0, model: VECTOR_MODEL, updatedAt: null };
+    }
+    throw error;
+  }
 }
 
 function buildKnowledgeContext(results) {
@@ -1440,6 +1480,16 @@ function scoreAliasMatch(content, fileName, question, aliasGroups = []) {
   return score;
 }
 
+function hasExplicitProjectReference(question, aliasGroups = []) {
+  const normalizedQuestion = normalizeText(question);
+  return aliasGroups.some((group) => {
+    const terms = [group.canonical, ...(Array.isArray(group.aliases) ? group.aliases : [])]
+      .filter(Boolean)
+      .map((term) => normalizeText(term));
+    return terms.some((term) => term && normalizedQuestion.includes(term));
+  });
+}
+
 function tokenize(question) {
   let normalized = normalizeText(question);
   for (const stopWord of PROJECT_STOP_WORDS) {
@@ -1650,6 +1700,148 @@ function scoreDocument(content, fileName, tokens, question = "", aliasGroups = [
   return score;
 }
 
+function runVectorCommand(paths, command, query = "", force = false) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      VECTOR_SEARCH_SCRIPT,
+      command,
+      "--knowledge-dir",
+      paths.knowledgeDir,
+      "--index",
+      paths.vectorIndex,
+      "--model",
+      VECTOR_MODEL,
+      "--cache-dir",
+      VECTOR_CACHE_DIR,
+    ];
+    if (query) {
+      args.push("--query", query, "--limit", "16");
+    }
+    if (force) {
+      args.push("--force");
+    }
+    const child = spawn(PARSER_PYTHON_CMD, args, {
+      cwd: __dirname,
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("向量索引处理超时"));
+    }, command === "build" ? 15 * 60_000 : 4 * 60_000);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      let payload = null;
+      try {
+        payload = JSON.parse(stdout.trim() || "{}");
+      } catch {
+        // The caller receives the original diagnostic below.
+      }
+      if (code === 0 && payload?.ok) {
+        resolve(payload);
+        return;
+      }
+      reject(new Error(payload?.error || stderr.trim() || stdout.trim() || "向量检索失败"));
+    });
+  });
+}
+
+async function searchSemanticKnowledge(question, paths) {
+  if (!VECTOR_ENABLED) {
+    return [];
+  }
+  const cacheKey = `${paths.id}:${normalizeText(question)}`;
+  const cached = vectorQueryCache.get(cacheKey);
+  if (cached && Date.now() - cached.createdAt < VECTOR_QUERY_CACHE_TTL_MS) {
+    return cached.results;
+  }
+  try {
+    const payload = await runVectorCommand(paths, "search", question);
+    const results = payload.results || [];
+    vectorQueryCache.set(cacheKey, { createdAt: Date.now(), results });
+    if (vectorQueryCache.size > 200) {
+      vectorQueryCache.delete(vectorQueryCache.keys().next().value);
+    }
+    return results;
+  } catch (error) {
+    const warningKey = `${paths.id}:${error.message}`;
+    if (!vectorSearchWarnings.has(warningKey)) {
+      vectorSearchWarnings.add(warningKey);
+      console.warn(`向量检索暂不可用，已回退关键词检索：${error.message}`);
+    }
+    return [];
+  }
+}
+
+function mergeHybridResults(keywordResults, semanticResults, question, aliasGroups) {
+  const candidates = new Map();
+  const maxKeywordScore = Math.max(...keywordResults.map((item) => item.score), 1);
+  const requireProjectMatch = hasExplicitProjectReference(question, aliasGroups);
+
+  keywordResults.forEach((item, rank) => {
+    const key = path.resolve(item.path).toLowerCase();
+    candidates.set(key, {
+      ...item,
+      keywordScore: item.score,
+      semanticScore: 0,
+      retrieval: "关键词",
+      hybridScore: 0.44 * (item.score / maxKeywordScore) + 0.12 / (rank + 1),
+      semanticSnippets: [],
+      projectMatch: scoreAliasMatch(item.snippet, item.file, question, aliasGroups) > 0,
+    });
+  });
+
+  semanticResults.forEach((item, rank) => {
+    const key = path.resolve(item.path).toLowerCase();
+    const semanticScore = Math.max(0, Number(item.semanticScore || 0));
+    const existing = candidates.get(key) || {
+      file: item.file,
+      path: item.path,
+      score: 0,
+      keywordScore: 0,
+      semanticScore: 0,
+      retrieval: "语义",
+      hybridScore: 0,
+      snippet: "",
+      semanticSnippets: [],
+      projectMatch: false,
+    };
+    existing.semanticScore = Math.max(existing.semanticScore, semanticScore);
+    existing.hybridScore += 0.48 * semanticScore + 0.1 / (rank + 1);
+    existing.retrieval = existing.keywordScore > 0 ? "混合" : "语义";
+    if (item.text && !existing.semanticSnippets.includes(item.text)) {
+      existing.semanticSnippets.push(item.text);
+    }
+    existing.projectMatch = existing.projectMatch || scoreAliasMatch(item.text, item.file, question, aliasGroups) > 0;
+    candidates.set(key, existing);
+  });
+
+  return Array.from(candidates.values())
+    .map((item) => ({
+      ...item,
+      score: Math.round(item.hybridScore * 1000),
+      snippet: mergeSnippets([
+        ...item.semanticSnippets.slice(0, 3),
+        item.snippet,
+      ]),
+    }))
+    .filter((item) => (item.keywordScore > 0 || item.semanticScore >= 0.36) && (!requireProjectMatch || item.projectMatch))
+    .sort((a, b) => b.hybridScore - a.hybridScore)
+    .slice(0, 5);
+}
+
 async function listMarkdownFiles(directory) {
   return listFilesRecursive(directory, new Set([".md"]));
 }
@@ -1660,18 +1852,15 @@ async function searchKnowledge(question, spaceId = DEFAULT_SPACE_ID) {
   const expandedQuestion = expandQuestionWithAliases(question, aliasGroups);
   const intent = classifyQuestionIntent(question);
   const tokens = tokenize(expandedQuestion);
-  if (tokens.length === 0) {
-    return [];
-  }
 
   const files = await listMarkdownFiles(paths.knowledgeDir);
-  const results = [];
+  const keywordResults = [];
   for (const filePath of files) {
     const content = await readFile(filePath, "utf8");
     const fileName = path.basename(filePath);
     const score = scoreDocument(content, fileName, tokens, question, aliasGroups);
     if (score > 0) {
-      results.push({
+      keywordResults.push({
         file: fileName,
         path: filePath,
         score,
@@ -1679,8 +1868,9 @@ async function searchKnowledge(question, spaceId = DEFAULT_SPACE_ID) {
       });
     }
   }
-
-  return results.sort((a, b) => b.score - a.score).slice(0, 5);
+  keywordResults.sort((a, b) => b.score - a.score);
+  const semanticResults = await searchSemanticKnowledge(expandedQuestion, paths);
+  return mergeHybridResults(keywordResults.slice(0, 12), semanticResults, question, aliasGroups);
 }
 
 function buildDraftAnswer(question, results) {
@@ -2290,6 +2480,26 @@ async function runImportJob(spaceId, jobId) {
       content: organizedContent,
     });
 
+    job = await patchImportJob(spaceId, jobId, {
+      status: "running",
+      phase: "更新语义索引",
+      progress: 96,
+    });
+    let vectorSummary = "语义索引未启用";
+    if (VECTOR_ENABLED) {
+      try {
+        const vectorResult = await runVectorCommand(paths, "build");
+        for (const cacheKey of vectorQueryCache.keys()) {
+          if (cacheKey.startsWith(`${paths.id}:`)) {
+            vectorQueryCache.delete(cacheKey);
+          }
+        }
+        vectorSummary = `语义索引：${vectorResult.files} 个文件 / ${vectorResult.chunks} 个片段`;
+      } catch (error) {
+        vectorSummary = `语义索引稍后自动重试：${error.message}`;
+      }
+    }
+
     await patchImportJob(spaceId, jobId, {
       status: "completed",
       phase: "已完成",
@@ -2300,6 +2510,7 @@ async function runImportJob(spaceId, jobId) {
         `知识整理已生成：${written.outputPath}`,
         `更新日志已记录：${written.logPath}`,
         `原始资料目录：${job.uploadDir}`,
+        vectorSummary,
       ].join("\n"),
     });
   } catch (error) {
@@ -2913,6 +3124,56 @@ async function handleAuditLogs(request, response, requestUrl) {
   sendJson(response, 200, { ok: true, logs });
 }
 
+async function handleRebuildVectorIndex(request, response) {
+  const user = request.authUser;
+  const payload = await readRequestJson(request, response);
+  if (!payload) {
+    return;
+  }
+  const space = normalizeSpaceId(payload.space || DEFAULT_SPACE_ID);
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response, "只有项目资料管理员可以更新语义索引");
+    return;
+  }
+  if (!VECTOR_ENABLED) {
+    sendJson(response, 409, { error: "当前没有启用向量语义检索" });
+    return;
+  }
+  try {
+    const paths = await ensureKnowledgeBase(space);
+    const result = await runVectorCommand(paths, "build", "", Boolean(payload.force));
+    for (const cacheKey of vectorQueryCache.keys()) {
+      if (cacheKey.startsWith(`${paths.id}:`)) {
+        vectorQueryCache.delete(cacheKey);
+      }
+    }
+    await appendAuditLog({ request, user, action: "vector.rebuild", space, detail: `${result.files} files / ${result.chunks} chunks` });
+    sendJson(response, 200, { ok: true, space, ...result, status: await readVectorIndexStatus(paths.vectorIndex) });
+  } catch (error) {
+    sendJson(response, 500, { error: "语义索引更新失败", detail: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function handleSearchDiagnostics(request, response, requestUrl) {
+  const user = request.authUser;
+  const space = normalizeSpaceId(requestUrl.searchParams.get("space") || DEFAULT_SPACE_ID);
+  const query = String(requestUrl.searchParams.get("q") || "").trim();
+  if (!userCanManageSpace(user, space)) {
+    sendForbidden(response, "只有项目资料管理员可以运行检索诊断");
+    return;
+  }
+  if (!query) {
+    sendJson(response, 400, { error: "请输入测试问题" });
+    return;
+  }
+  try {
+    const results = await searchKnowledge(query, space);
+    sendJson(response, 200, { ok: true, space, query, results });
+  } catch (error) {
+    sendJson(response, 500, { error: "检索诊断失败", detail: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 async function serveStatic(request, response) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const routeMap = {
@@ -3109,6 +3370,16 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "GET" && requestUrl.pathname === "/api/audit-logs") {
     await handleAuditLogs(request, response, requestUrl);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/vector-index/rebuild") {
+    await handleRebuildVectorIndex(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/search-diagnostics") {
+    await handleSearchDiagnostics(request, response, requestUrl);
     return;
   }
 

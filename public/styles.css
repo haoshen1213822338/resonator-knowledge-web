@@ -853,6 +853,18 @@ button:disabled {
   line-height: 1.55;
 }
 
+.status-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.status-actions span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .update-status {
   min-height: 64px;
   margin: 10px 0 0;

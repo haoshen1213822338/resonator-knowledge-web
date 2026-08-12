@@ -44,6 +44,9 @@ const vaultState = document.querySelector("#vault-state");
 const aiFileCount = document.querySelector("#ai-file-count");
 const rawFileCount = document.querySelector("#raw-file-count");
 const apiState = document.querySelector("#api-state");
+const vectorState = document.querySelector("#vector-state");
+const vectorDetail = document.querySelector("#vector-detail");
+const rebuildVectorIndexButton = document.querySelector("#rebuild-vector-index");
 const kbPath = document.querySelector("#kb-path");
 const refreshStatus = document.querySelector("#refresh-status");
 const importPanel = document.querySelector("#import-panel");
@@ -237,7 +240,7 @@ function renderSources(citations) {
             <span class="source-index">${index + 1}</span>
             <p class="source-title">${escapeHtml(item.file)}</p>
           </div>
-          <div class="source-meta">相关度：${item.score}</div>
+          <div class="source-meta">${escapeHtml(item.retrieval || "关键词")}命中 · 综合相关度：${item.score}</div>
           <details class="source-details">
             <summary>查看引用片段</summary>
             <div class="source-snippet">${escapeHtml(item.snippet)}</div>
@@ -992,11 +995,51 @@ function renderKnowledgeStatus(status) {
   if (apiState) {
     apiState.textContent = status.hasApiKey ? "已连接" : "未配置";
   }
+  if (vectorState) {
+    vectorState.textContent = status.vectorEnabled
+      ? status.vectorIndex?.ready ? "已建立" : "待建立"
+      : "未启用";
+  }
+  if (vectorDetail) {
+    vectorDetail.textContent = status.vectorIndex?.ready
+      ? `${status.vectorIndex.files} 个文件 · ${status.vectorIndex.chunks} 个语义片段`
+      : `本地模型：${status.vectorModel || "未配置"}`;
+  }
   if (kbPath) {
     kbPath.textContent = [
       `当前项目库：${status.spaceRoot}`,
       `最近更新：${formatLatestUpdate(status.latestUpdate)}`,
     ].join("  ·  ");
+  }
+}
+
+async function rebuildVectorIndex() {
+  if (!rebuildVectorIndexButton) {
+    return;
+  }
+  rebuildVectorIndexButton.disabled = true;
+  rebuildVectorIndexButton.textContent = "正在更新...";
+  if (vectorDetail) {
+    vectorDetail.textContent = "首次建立会下载本地模型，可能需要几分钟。";
+  }
+  try {
+    const response = await apiFetch("/api/vector-index/rebuild", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ space: getCurrentSpace() }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || "语义索引更新失败");
+    }
+    await loadKnowledgeStatus();
+  } catch (error) {
+    if (vectorDetail) {
+      vectorDetail.textContent = error instanceof Error ? error.message : "语义索引更新失败";
+    }
+  } finally {
+    rebuildVectorIndexButton.disabled = false;
+    rebuildVectorIndexButton.textContent = "更新语义索引";
   }
 }
 
@@ -1525,6 +1568,7 @@ refreshStatus?.addEventListener("click", async () => {
   await loadImportJobs();
   await loadManagedFiles();
 });
+rebuildVectorIndexButton?.addEventListener("click", rebuildVectorIndex);
 refreshFiles?.addEventListener("click", loadManagedFiles);
 toggleFileManager?.addEventListener("click", () => {
   applyFileManagerCollapsed(!isFileManagerCollapsed());

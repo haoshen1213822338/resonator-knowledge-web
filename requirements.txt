@@ -5,3 +5,5 @@ openpyxl
 python-pptx
 rapidocr-onnxruntime
 faster-whisper
+fastembed
+httpx[socks]
